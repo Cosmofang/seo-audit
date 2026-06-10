@@ -1,6 +1,6 @@
 ---
 name: seo-audit
-description: "Audit and optimize any website's SEO + GEO (AI/LLM visibility), then fix what's broken. Runs a portable, zero-dependency hard-gate audit over a build output directory (Astro/Next/Hugo/Jekyll/plain HTML) and a live-URL crawl/GEO audit (robots.txt AI-crawler policy, sitemap, llms.txt, on-page JSON-LD, canonical, security headers). Use when asked to: check/improve a site's SEO, raise a Lighthouse/PageSpeed SEO score, make a site discoverable by AI agents (ChatGPT/Claude/Perplexity/Gemini), add structured data, set up robots/sitemap/llms.txt, or review a site before launch. Distilled from the reference site's production build-time SEO gates."
+description: "Audit and optimize any website's SEO + GEO (AI/LLM visibility) + Core Web Vitals, then fix what's broken. Runs a portable, zero-dependency hard-gate audit over a build output directory (Astro/Next/Hugo/Jekyll/plain HTML) and a live-URL crawl/GEO audit (robots.txt AI-crawler policy, sitemap, llms.txt, on-page JSON-LD, canonical, security headers). Includes a battle-tested LCP playbook (7.5s → 1.5s mobile on the reference site): render-blocking CSS, critical-CSS split, font preload discipline, third-party JS deferral. Use when asked to: check/improve a site's SEO, raise a Lighthouse/PageSpeed score, fix slow LCP / Core Web Vitals, make a site discoverable by AI agents (ChatGPT/Claude/Perplexity/Gemini), add structured data, set up robots/sitemap/llms.txt, or review a site before launch. Distilled from the reference site's production build-time SEO gates."
 compatibility: Claude Code, Claude Desktop, Cursor
 keywords:
   - seo-audit
@@ -16,6 +16,12 @@ keywords:
   - lighthouse
   - pagespeed
   - core-web-vitals
+  - lcp
+  - render-blocking
+  - critical-css
+  - font-loading
+  - LCP优化
+  - 性能优化
   - open-graph
   - schema.org
   - technical-seo
@@ -55,6 +61,7 @@ The rules here are distilled from a production site whose build **fails** if any
 - "Check/improve my site's SEO", "raise my PageSpeed/Lighthouse SEO score", "review before launch"
 - "Make my site visible to AI / ChatGPT / Claude / Perplexity", "add llms.txt", "fix robots for AI crawlers"
 - "Add structured data / JSON-LD / schema", "set up sitemap / canonical / Open Graph"
+- "My LCP is slow / fix Core Web Vitals / PageSpeed says my site takes 7 s to load"
 
 ## What you have
 - `scripts/audit-seo.mjs` — **on-disk auditor.** Runs the 12 hard-gate checks over a directory of built HTML + its local CSS/JS/images. Framework-agnostic. Node ≥18, no install.
@@ -62,6 +69,7 @@ The rules here are distilled from a production site whose build **fails** if any
 - `references/hard-gates.md` — the 12 gates: exact thresholds, the general rule, and the Astro+Cloudflare reference implementation.
 - `references/structured-data.md` — copy-paste JSON-LD recipes (Organization, WebSite, Breadcrumb, Article, Product, FAQ) using the nested `@graph` pattern.
 - `references/geo-ai-visibility.md` — the GEO layer: robots AI-crawler allowlist (exact user-agents), `llms.txt` format, AI-oriented schema, IndexNow.
+- `references/lcp-playbook.md` — **Core Web Vitals deep-dive**: the measured levers that took the reference site from 7.5 s → ~1.5 s mobile LCP (render-blocking CSS, critical-CSS split, font discipline, deferring non-LCP DOM, third-party JS, CLS guardrails, CI lock-in). Use when the problem is *speed*, not markup.
 
 ## Workflow
 
@@ -102,6 +110,8 @@ This is where GEO shows up: which AI crawlers are allowed/blocked, whether `llms
 
 GEO layer (references/geo-ai-visibility.md): robots.txt explicitly **allows** the major AI crawlers, ship **`llms.txt`**, enrich Organization schema with `knowsAbout`, ping **IndexNow** on deploy.
 
+**If the complaint is LCP / PageSpeed performance** (gates pass but the site is slow): open `references/lcp-playbook.md`. Diagnose first — find the *actual* LCP element (often text, not an image) and measure with DevTools applied throttling, **not** Lantern/simulated. Then work the levers in impact order: render-blocking CSS → critical-CSS split → font preload discipline → defer non-LCP viewport DOM → eager hero image → third-party JS on idle/interaction → IntersectionObserver-deferred init. Keep CLS at 0 by reserving space for everything you defer, and lock wins in with a Lighthouse CI gate + per-page JS byte budget.
+
 ## Notes
 - 404/50x pages are exempt from canonical/description/OG/JSON-LD (they're noindex by design) — the auditor already skips them.
 - The auditor uses conservative regex extraction, not a full DOM — it's for audit *signals*. A clean run is strong evidence, not a formal guarantee.
@@ -118,6 +128,7 @@ seo-audit is an **actionable SEO + GEO auditing harness**. Two zero-dependency N
 | On-disk hard-gate audit | `audit-seo.mjs` runs 12 hard gates (h1, viewport, landmarks, title/desc, canonical, OG, images, CSP-safe scripts, no external refs, page weight, JSON-LD, URL hygiene) over any built static dir |
 | Live-URL GEO audit | `audit-live.mjs` checks robots.txt AI-crawler policy, sitemap.xml, llms.txt, homepage JSON-LD (`@graph`-aware), canonical, HSTS/Vary/Cache-Control |
 | Fix references | `references/` gives exact thresholds, copy-paste JSON-LD recipes, and the AI-crawler allowlist + llms.txt format |
+| LCP playbook | `references/lcp-playbook.md` — measured Core Web Vitals levers (7.5 s → 1.5 s mobile LCP on the reference site) with diagnosis method, impact ranking, CLS guardrails, and CI lock-in |
 | CI integration | `audit-seo.mjs --strict` turns warnings into errors so regressions fail the build |
 
 **Does NOT:**
@@ -189,3 +200,7 @@ node scripts/audit-live.mjs            # should print usage and exit 2
 ```
 
 Both scripts are zero-dependency (Node ≥18). No `npm install` step is needed.
+
+---
+
+*Version: 1.1.0 · Created: 2026-06-09 · Updated: 2026-06-10 · Changes: see [CHANGELOG.md](CHANGELOG.md)*

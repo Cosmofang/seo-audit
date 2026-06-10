@@ -21,7 +21,8 @@ seo-audit/                 ← 这个目录本身就是 seo-audit skill（可直
 ├── references/
 │   ├── hard-gates.md          ← 12 门禁：精确阈值 + 为什么 + 通用修法 + Astro/CF 参考实现
 │   ├── structured-data.md     ← JSON-LD（@graph 嵌套）配方：Org/WebSite/面包屑/Article/Product/FAQ
-│   └── geo-ai-visibility.md   ← GEO 招牌层：AI 爬虫精确 UA 白名单 / llms.txt / knowsAbout / IndexNow
+│   ├── geo-ai-visibility.md   ← GEO 招牌层：AI 爬虫精确 UA 白名单 / llms.txt / knowsAbout / IndexNow
+│   └── lcp-playbook.md        ← LCP 实战手册：参考站移动端 7.5s → 1.5s 的全部实测杠杆 + CLS 护栏 + CI 锁定
 └── analysis/
     └── case-study-build-time-seo-gates.md   ← 深度分析：跑分高的根因 + 生产站实测结果
 ```
@@ -98,6 +99,8 @@ cp -R . ~/.claude/skills/seo-audit
 | 12 | URL 规范 | 全小写 / 尾斜杠 / ≤3 级 / 单一路由源 |
 
 **GEO 层**：robots 显式放行主流 AI 爬虫 + ship `llms.txt` + `Organization.knowsAbout` 写清楚做什么 + 部署后 ping IndexNow。详见 `references/geo-ai-visibility.md`。
+
+**性能层（LCP / Core Web Vitals）**：门禁全过但站还是慢？看 `references/lcp-playbook.md` —— 参考站移动端 LCP 7.5s → 1.5s 的实测杠杆，按影响排序：消灭 render-blocking CSS → 关键 CSS 拆分 → 字体 preload 纪律（无用 preload 反而占满关键路径）→ 延后首屏非 LCP 重 DOM → hero 图 eager + fetchpriority → 三方 JS 推迟到 idle/首次交互。核心方法论：先找到**真正的 LCP 元素**（常常是文字不是图），用 DevTools 实测节流（别信 Lantern 模拟值），每改一步都量一次，最后用 Lighthouse CI 门禁 + 单页 JS 字节预算把战果锁死。
 
 逐条「精确阈值 + 为什么 + 怎么修」看 `references/hard-gates.md`；想看跑分高的根因和实测看 `analysis/case-study-build-time-seo-gates.md`。
 

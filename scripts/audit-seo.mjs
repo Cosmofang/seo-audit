@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // audit-seo.mjs — portable, zero-dependency on-disk SEO/quality auditor.
 //
-// Runs the the reference site build-time "hard gate" checks against ANY built static
+// Runs the reference site build-time "hard gate" checks against ANY built static
 // site (a directory of .html files + their local CSS/JS/images). Framework
 // agnostic: point it at Astro `dist/`, Next `out/`, Hugo `public/`, a Jekyll
 // `_site/`, or a plain folder of HTML.
