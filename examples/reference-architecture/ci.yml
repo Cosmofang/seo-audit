@@ -1,0 +1,24 @@
+name: seo-ci
+
+on:
+  pull_request:
+
+jobs:
+  build-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - name: Build production-bound output
+        run: PUBLIC_SITE_ORIGIN=https://www.example.com npm run build
+      - name: Rendered SEO audit
+        run: node vendor/seo-audit/scripts/audit-seo.mjs --dir dist --origin https://www.example.com --strict
+      - name: Lighthouse metric gates
+        run: npx lhci autorun
+      - name: Multi-UA parity gate
+        run: npm run check:ai-parity

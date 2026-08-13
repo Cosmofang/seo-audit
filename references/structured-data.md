@@ -1,12 +1,28 @@
-# Structured data (JSON-LD) recipes
+# Structured data and entity consistency
 
-JSON-LD is the highest-leverage GEO move after being crawlable: it's how Google rich results **and** LLMs reliably extract entities and facts. Emit it as `<script type="application/ld+json">` (a non-executable data block — allowed under strict CSP `script-src 'self'`, no nonce needed).
+Structured data should make visible, factual content easier to interpret. It does not replace crawlable content and does not guarantee a rich result or AI citation.
 
-## The nested `@graph` pattern (use this)
-Ship **one** `<script type="application/ld+json">` per page containing a `@graph` array, rather than many separate blocks. Cross-link nodes with `@id` so machines see one connected entity graph. This is exactly what the reference site prod ships (verified: `Organization, WebSite, FAQPage, WebPage, Service, Product, SoftwareApplication…` in a single graph).
+## Contents
 
-```html
-<script type="application/ld+json">
+- Graph model and stable IDs
+- Site-wide and page-specific nodes
+- Breadcrumbs and localization
+- Validation and change process
+
+## Graph model
+
+Use stable site-level identifiers:
+
+```text
+https://www.example.com/#organization
+https://www.example.com/#website
+https://www.example.com/product/#webpage
+https://www.example.com/product/#product
+```
+
+Reference those identifiers instead of creating disconnected copies of the same entity on every page.
+
+```json
 {
   "@context": "https://schema.org",
   "@graph": [
@@ -14,77 +30,90 @@ Ship **one** `<script type="application/ld+json">` per page containing a `@graph
       "@type": "Organization",
       "@id": "https://www.example.com/#organization",
       "name": "Example",
-      "url": "https://www.example.com/",
-      "logo": { "@type": "ImageObject", "url": "https://www.example.com/logo.png", "width": 200, "height": 200 },
-      "image": "https://www.example.com/og-image.png",
-      "description": "One-sentence what-you-do, entity-rich.",
-      "sameAs": ["https://www.linkedin.com/company/example/", "https://x.com/example"],
-      "knowsAbout": ["Topic A", "Topic B", "Topic C"]
+      "url": "https://www.example.com/"
     },
     {
       "@type": "WebSite",
       "@id": "https://www.example.com/#website",
-      "name": "Example",
       "url": "https://www.example.com/",
       "publisher": { "@id": "https://www.example.com/#organization" }
     },
     {
       "@type": "WebPage",
-      "@id": "https://www.example.com/some-page/#webpage",
-      "url": "https://www.example.com/some-page/",
-      "name": "Page title",
+      "@id": "https://www.example.com/product/#webpage",
+      "url": "https://www.example.com/product/",
       "isPartOf": { "@id": "https://www.example.com/#website" },
-      "about": { "@id": "https://www.example.com/#organization" }
+      "about": { "@id": "https://www.example.com/product/#product" }
     }
   ]
 }
-</script>
 ```
 
-## Rules
-- **Site-wide:** `Organization` + `WebSite` on every page (the auditor warns if either is missing on the homepage).
-- **Absolute URLs everywhere** — `@id`, `url`, `logo`, `item`. Build them from the same `PUBLIC_SITE_ORIGIN` used for canonical, at build time.
-- **`@id` discipline:** stable fragment IDs (`/#organization`, `/#website`) so other nodes reference them instead of duplicating.
-- **Match visible content.** JSON-LD that contradicts the page is a spam signal. Don't markup FAQs/reviews that aren't on the page.
-- **Validate:** validator.schema.org and Google Rich Results Test before shipping.
+## Site-wide nodes
 
-## `knowsAbout` (the GEO multiplier)
-On `Organization`, list the topics/entities you want to be associated with. This directly feeds how LLMs decide what your brand is "about" and when to recommend it. the reference site lists: `Agentic commerce, AI shopping agents, Generative engine optimization, AI search optimization, Product schema, Structured data, llms.txt, AI referral traffic`. Pick 6–10 real, specific topics — not keyword stuffing.
+Organization fields should be sourced from an entity record, not copied independently into templates:
 
-## Per-page type recipes (add to the `@graph`)
+- Name, canonical URL and stable `@id`.
+- Logo/image with absolute URLs.
+- A factual description.
+- Verified public profiles in `sameAs`.
+- Locale-aware `inLanguage` and description when serving translations.
+- `knowsAbout` only for topics the organization demonstrably covers.
 
-**Breadcrumb** — emit on every non-home page; also render a visible breadcrumb.
-```json
-{ "@type": "BreadcrumbList", "itemListElement": [
-  { "@type": "ListItem", "position": 1, "name": "Home", "item": "https://www.example.com/" },
-  { "@type": "ListItem", "position": 2, "name": "Guides", "item": "https://www.example.com/guides/" },
-  { "@type": "ListItem", "position": 3, "name": "This page", "item": "https://www.example.com/guides/this/" }
-] }
-```
+`knowsAbout` is an entity hint in Schema.org. Treat it as semantic metadata, not a proven direct AI recommendation lever.
 
-**Article / BlogPosting** — for blog/editorial.
-```json
-{ "@type": "BlogPosting", "@id": ".../post/#article", "headline": "…", "description": "…",
-  "datePublished": "2026-01-01", "dateModified": "2026-01-02",
-  "author": { "@type": "Person", "name": "…" },
-  "publisher": { "@id": "https://www.example.com/#organization" },
-  "mainEntityOfPage": { "@id": ".../post/#webpage" } }
-```
+WebSite should identify the site and publisher. Add SearchAction only if the site actually exposes a compatible search function.
 
-**Product** — for ecommerce/product pages.
-```json
-{ "@type": "Product", "name": "…", "image": ["https://…/p.jpg"], "description": "…",
-  "brand": { "@type": "Brand", "name": "…" },
-  "offers": { "@type": "Offer", "price": "29.00", "priceCurrency": "USD",
-    "availability": "https://schema.org/InStock", "url": "https://…/product/" } }
-```
+## Page-specific types
 
-**FAQPage** — only if the Q&A is actually rendered on the page.
-```json
-{ "@type": "FAQPage", "mainEntity": [
-  { "@type": "Question", "name": "Q?", "acceptedAnswer": { "@type": "Answer", "text": "A." } }
-] }
-```
+Choose a type because the visible page supports it:
 
-## Reference implementation
-the reference site builds these in `apps/web/src/lib/seo.ts` (`buildOrganizationJsonLd`, `buildWebsiteJsonLd`, `buildBreadcrumbJsonLd` — the last rejects a trailing-slash origin and a non-`/` path so canonical/`@id` URLs are always well-formed) and renders via a `JsonLd.astro` component wired into the base layout + per-route `jsonLd` fields.
+| Page | Common node |
+|---|---|
+| Product or software offer | Product / SoftwareApplication with accurate Offer fields |
+| Editorial article | Article / BlogPosting with real author and dates |
+| Definition page | DefinedTerm plus WebPage/Article where appropriate |
+| Listing hub | CollectionPage plus ItemList |
+| General landing page | WebPage |
+| Visible breadcrumb UI | BreadcrumbList |
+| Visible FAQ content | FAQPage only when current search policy permits and content is on page |
+
+Avoid forcing every page into Product or Article. A modest, truthful WebPage node is better than an unsupported rich type.
+
+## Breadcrumbs
+
+BreadcrumbList items need ordered positions, names and absolute URLs. Generate visible breadcrumbs and JSON-LD from the same route metadata so labels and destinations cannot drift.
+
+## Localization
+
+Each translated page is its own WebPage with:
+
+- Self canonical.
+- Locale-appropriate `inLanguage`.
+- Translated human-visible fields.
+- Stable language-neutral Organization `@id` so knowledge graphs can merge the entity.
+- Product identifiers shared only when the translated page describes the same actual product.
+
+Do not translate brands, protocol names, SKUs or legal identifiers inconsistently.
+
+## Validation
+
+Run three layers:
+
+1. JSON syntax parsing during build.
+2. Schema structure/unit tests for builders and stable IDs.
+3. External validators appropriate to the consumer, such as Schema.org Validator and Google Rich Results Test.
+
+Also compare schema facts to visible content and source systems. Syntax-valid false data is a more serious problem than missing optional markup.
+
+## Change process
+
+When adding a schema node:
+
+1. Identify the visible source for every claim.
+2. Choose the narrowest valid type.
+3. Reuse stable site entity IDs.
+4. Add unit tests for required fields, URLs, locale and relationships.
+5. Build and parse the rendered JSON-LD.
+6. Validate on staging without allowing staging to be indexed.
+7. Revalidate the production URL after deploy.
