@@ -17,8 +17,9 @@ if (!base || !/^https?:\/\//.test(base)) {
 }
 const origin = new URL(base).origin;
 
-const out = []; // {sev:'ok'|'warn'|'error', area, msg}
+const out = []; // {sev:'ok'|'info'|'warn'|'error', area, msg}
 const ok = (area, msg) => out.push({ sev: 'ok', area, msg });
+const info = (area, msg) => out.push({ sev: 'info', area, msg });
 const warn = (area, msg) => out.push({ sev: 'warn', area, msg });
 const err = (area, msg) => out.push({ sev: 'error', area, msg });
 
@@ -60,34 +61,55 @@ function parseRobots(txt) {
   }
   return groups;
 }
-// Resolve effective policy for a UA: most specific matching group wins.
+// Resolve root-path policy and preserve whether it was explicit, inherited
+// from User-agent: *, or unspecified. This is intentionally a root-policy
+// summary, not a full RFC-grade robots matcher for arbitrary paths.
 function policyFor(groups, ua) {
   const lc = ua.toLowerCase();
-  let g = groups.find((x) => x.agents.some((a) => a.toLowerCase() === lc))
-       || groups.find((x) => x.agents.includes('*'));
-  if (!g) return 'unspecified';
-  const blocksRoot = g.disallow.includes('/') && !g.allow.includes('/');
-  return blocksRoot ? 'blocked' : 'allowed';
+  const exact = groups.filter((x) => x.agents.some((a) => a.toLowerCase() === lc));
+  const fallback = groups.filter((x) => x.agents.includes('*'));
+  const selected = exact.length ? exact : fallback;
+  if (!selected.length) return { policy: 'unspecified', source: 'none' };
+  const allow = selected.flatMap((x) => x.allow);
+  const disallow = selected.flatMap((x) => x.disallow);
+  const blocksRoot = disallow.includes('/') && !allow.includes('/');
+  return {
+    policy: blocksRoot ? 'blocked' : 'allowed',
+    source: exact.length ? 'explicit' : 'inherited',
+  };
 }
 
 async function run() {
   // ---- robots.txt ----
   const robots = await get('/robots.txt');
-  if (robots.status !== 200) {
-    err('robots', `robots.txt returned ${robots.status} (expected 200)`);
+  if (robots.status === 404) {
+    info('robots', 'robots.txt not present; crawling is unrestricted unless access is blocked elsewhere');
+  } else if (robots.status === 0 || robots.status >= 500) {
+    err('robots', `robots.txt could not be fetched reliably (status ${robots.status})`);
+  } else if (robots.status !== 200) {
+    warn('robots', `robots.txt returned ${robots.status}; verify crawler handling`);
   } else {
     const groups = parseRobots(robots.text);
     const star = policyFor(groups, '*');
-    if (star === 'blocked') err('robots', 'User-agent: * is Disallow: / — site blocked from all crawlers');
-    else ok('robots', `default crawler policy: ${star}`);
+    if (star.policy === 'blocked') err('robots', 'User-agent: * is Disallow: / — site blocked from all crawlers');
+    else if (star.policy === 'allowed') ok('robots', 'default crawler group allows the root path');
+    else info('robots', 'no User-agent: * group; crawler-specific groups may still apply');
 
     if (/sitemap\s*:/i.test(robots.text)) ok('robots', 'declares Sitemap:');
     else warn('robots', 'no Sitemap: directive in robots.txt');
 
-    const blocked = [], allowed = [];
-    for (const bot of AI_BOTS) (policyFor(groups, bot) === 'blocked' ? blocked : allowed).push(bot);
-    ok('geo', `AI crawlers allowed: ${allowed.join(', ') || '(none explicit)'}`);
-    if (blocked.length) warn('geo', `AI crawlers blocked (hurts AI visibility): ${blocked.join(', ')}`);
+    const explicit = [], inherited = [], blocked = [], unspecified = [];
+    for (const bot of AI_BOTS) {
+      const result = policyFor(groups, bot);
+      if (result.policy === 'blocked') blocked.push(bot);
+      else if (result.source === 'explicit') explicit.push(bot);
+      else if (result.source === 'inherited') inherited.push(bot);
+      else unspecified.push(bot);
+    }
+    if (explicit.length) ok('geo', `AI crawlers explicitly allowed: ${explicit.join(', ')}`);
+    if (inherited.length) info('geo', `AI crawlers inheriting User-agent: * policy: ${inherited.join(', ')}`);
+    if (unspecified.length) info('geo', `AI crawler policy unspecified: ${unspecified.join(', ')}`);
+    if (blocked.length) warn('geo', `AI crawlers blocked; review against training/search policy: ${blocked.join(', ')}`);
   }
 
   // ---- sitemap.xml ----
@@ -102,8 +124,8 @@ async function run() {
 
   // ---- llms.txt (GEO) ----
   const llms = await get('/llms.txt');
-  if (llms.status === 200 && llms.text.trim()) ok('geo', 'llms.txt present (AI-readable site map)');
-  else warn('geo', 'no /llms.txt — add an AI-readable index of authoritative pages');
+  if (llms.status === 200 && llms.text.trim()) info('geo', 'experimental llms.txt present');
+  else info('geo', 'no /llms.txt (experimental convention, not a search requirement)');
 
   // ---- homepage: JSON-LD, canonical, OG, headers ----
   const home = await get('/');
@@ -122,19 +144,29 @@ async function run() {
     const types = [...home.text.matchAll(/<script[^>]*application\/ld\+json[^>]*>([\s\S]*?)<\/script>/gi)]
       .flatMap((m) => { try { return typesOf(JSON.parse(m[1])); } catch { return ['(unparseable)']; } });
     if (types.length) ok('jsonld', `JSON-LD @types: ${types.join(', ')}`);
-    else warn('jsonld', 'no JSON-LD on homepage (add Organization + WebSite)');
+    else info('jsonld', 'no JSON-LD on homepage; add only types that match visible content and business needs');
     for (const want of ['Organization', 'WebSite'])
-      if (!types.includes(want)) warn('jsonld', `missing ${want} structured data`);
+      if (!types.includes(want)) info('jsonld', `${want} structured data not detected (optional, not a ranking requirement)`);
 
-    if (/<link[^>]*rel=["']?canonical/i.test(home.text)) ok('canonical', 'homepage has canonical');
-    else warn('canonical', 'homepage missing canonical');
+    const canonicalTag = home.text.match(/<link[^>]*rel=["']?canonical[^>]*>/i)?.[0];
+    const canonicalHref = canonicalTag?.match(/\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+    const href = canonicalHref?.[1] ?? canonicalHref?.[2] ?? canonicalHref?.[3] ?? '';
+    if (!canonicalTag) warn('canonical', 'homepage missing canonical');
+    else {
+      try {
+        const canonicalUrl = new URL(href);
+        if (canonicalUrl.origin === origin && canonicalUrl.pathname === '/') ok('canonical', 'homepage canonical matches origin root');
+        else warn('canonical', `homepage canonical points to ${canonicalUrl.href}; expected ${origin}/ unless intentionally cross-canonicalized`);
+      } catch {
+        warn('canonical', `homepage canonical is not an absolute URL: "${href}"`);
+      }
+    }
 
     // headers
     const h = home.headers;
     if (h.get('strict-transport-security')) ok('headers', 'HSTS present');
     else warn('headers', 'no Strict-Transport-Security header');
-    if ((h.get('vary') || '').toLowerCase().includes('user-agent')) ok('headers', 'Vary: User-Agent present');
-    else warn('headers', 'no "Vary: User-Agent" (set if you branch HTML by UA)');
+    if ((h.get('vary') || '').toLowerCase().includes('user-agent')) info('headers', 'Vary: User-Agent present');
     const cc = h.get('cache-control') || '';
     if (cc) ok('headers', `Cache-Control: ${cc}`);
     else warn('headers', 'no Cache-Control on homepage');
@@ -142,7 +174,7 @@ async function run() {
 
   // ---- report ----
   if (JSON_OUT) { console.log(JSON.stringify({ origin, findings: out }, null, 2)); return; }
-  const icon = { ok: '✓', warn: '⚠', error: '✗' };
+  const icon = { ok: '✓', info: 'i', warn: '⚠', error: '✗' };
   let area = '';
   for (const f of out.sort((a, b) => a.area.localeCompare(b.area))) {
     if (f.area !== area) { area = f.area; console.log(`\n[${area}]`); }
@@ -150,7 +182,8 @@ async function run() {
   }
   const e = out.filter((x) => x.sev === 'error').length;
   const w = out.filter((x) => x.sev === 'warn').length;
-  console.log(`\n${'─'.repeat(56)}\norigin: ${origin}\nerrors: ${e}   warnings: ${w}`);
+  const i = out.filter((x) => x.sev === 'info').length;
+  console.log(`\n${'─'.repeat(56)}\norigin: ${origin}\nerrors: ${e}   warnings: ${w}   info: ${i}`);
   process.exit(e > 0 ? 1 : 0);
 }
 run();

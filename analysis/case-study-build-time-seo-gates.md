@@ -1,12 +1,14 @@
 # 一个网站为什么 SEO 跑分高 —— 深度分析 + 生产站实测（案例脱敏）
 
 > 案例来源已脱敏，下文以 `example.com`（生产域）/ `staging.example.com`（预发域）/「该工程仓」指代一个真实生产站点。所有方法论与实测结构均为真实数据，仅隐去品牌与域名。
+>
+> **证据边界（2026-08-13 补充）：**这是单站工程案例（D 级证据），展示一套曾有效的质量策略，不证明每条门禁都是 Google 排名要求，也不证明 JSON-LD、`knowsAbout` 或 `llms.txt` 会直接带来 AI 推荐。通用决策以 `knowledge/` 和当前官方来源为准。
 
 ---
 
 ## 一句话结论
 
-跑分高不是靠某个插件或事后优化，而是**把 SEO/性能/可访问性的底线变成了"构建时强制门禁"**：10 条规则任一不达标，`build` 直接失败、根本部署不出去。再叠一层别人很少做的 **GEO（让 AI 助手能爬、能引用、能推荐）**。规则前置到 CI、人无法绕过 → 每个上线页面天然合规。
+该案例跑分稳定的主要工程原因，是把 SEO markup、性能、可访问性和安全偏好变成**构建时质量门禁**：10 条规则任一不达标，`build` 直接失败。它还叠加了 AI 爬虫策略和实验性 GEO 层。规则前置能减少回归，但“通过门禁”不等于页面一定被索引、排名或被 AI 引用。
 
 这份报告把这套机制拆开讲清楚，并附上用本工具包对**一个生产站**跑出来的实测结果作为佐证。
 
@@ -30,7 +32,7 @@
 | `audit-external` | HTML/CSS 里不许有跨域 `<link>/<script>/<img>/url()/@import`（白名单空） | 自托管 → 去三方握手、满足 CSP、去隐私依赖 |
 | `audit-admin-isolation` | admin bundle 不许泄漏进主站公开 HTML/JS/CSS | 后台不污染主站 SEO 面 |
 
-补：`codemod-nofollow.mjs`（build 后给所有跨 host `<a>` 加 `rel="nofollow noopener"`）。
+历史实现还包含 `codemod-nofollow.mjs`，曾给所有跨 host `<a>` 加 `rel="nofollow noopener"`。**这不应复用为通用规则：**可信编辑外链无需 `nofollow`；赞助和 UGC 应分别使用 `sponsored`、`ugc`，`noopener` 才是独立安全属性。
 
 **关键设计点（值得复用到任何项目）：**
 - **canonical 是构建期烤进 HTML 的，不是运行期算的。** 用 `PUBLIC_SITE_ORIGIN` 环境变量在 build 时注入：`build:dev` → staging 域、`build:prod` → 生产域。一份产物绑一个域，**禁止同一份 dist 部署到两个域**（否则 canonical 发错域 = 灾难）。运行时（如 CDN Worker）的变量**不会**进静态构建，不能拿来做 canonical。
@@ -38,16 +40,16 @@
 - **Astro 要显式 `vite.build.assetsInlineLimit: 0`**，否则它默认把小 `<script>` inline 进 HTML，和严格 CSP 撞车、也被 audit-inline 拦。
 
 ### 第 2 层 —— 结构化数据（嵌套 @graph）
-SEO 库构造、JSON-LD 组件渲染：全站注入 **Organization + WebSite**，按路由加 Article/Product/FAQPage，面包屑自动出 **BreadcrumbList**。全部用嵌套 `@graph` + 稳定 `@id`（`/#organization`、`/#website`）互相引用，绝对 URL 与 canonical 同源构建。这是「让机器（Google 富结果 + LLM）可靠抽取实体与事实」的核心杠杆。
+SEO 库构造、JSON-LD 组件渲染：全站注入 **Organization + WebSite**，按路由加 Article/Product/FAQPage，面包屑自动出 **BreadcrumbList**。全部用嵌套 `@graph` + 稳定 `@id`（`/#organization`、`/#website`）互相引用，绝对 URL 与 canonical 同源构建。这是该站表达实体与事实的工程方式；结构化数据提供理解与富结果资格，不保证展示、排名或 LLM 引用。
 
-`Organization.knowsAbout` 列了若干主题—— 直接影响 LLM 认为"这个品牌是关于什么的、什么场景该推荐它"。
+`Organization.knowsAbout` 列了若干真实主题，作为实体描述实验；目前没有可靠证据证明它直接影响 LLM 推荐。
 
 ### 第 3 层 —— GEO / AI 可见性（招牌、和别人拉开差距的部分）
 边缘 Worker 的 SEO 层：
 - **robots**：生产环境对主流 AI 爬虫**显式 `Allow: /`**（OpenAI 的 GPTBot/OAI-SearchBot/ChatGPT-User、Anthropic 的 ClaudeBot/Claude-User/Claude-SearchBot、Perplexity、Google-Extended…），只 Disallow `/admin/`、`/api/admin/`。逻辑是"靠 AI 可见性吃饭，当然要让 AI 爬虫进来"。
-- **llms.txt**：动态生成 `/llms.txt`——给 LLM 的分区站点地图（Start here / Concepts / Research / Industry guides），从路由表生成、排除法务页和纯表单页。
+- **llms.txt（实验）**：动态生成 `/llms.txt` 作为分区导航，从路由表生成、排除法务页和纯表单页。它不是搜索引擎或 AI 搜索收录要求。
 - **sitemap + noindex**：sitemap 与 robots 共用同一份 `NOINDEX_PATHS` 单一可信源，避免漂移。
-- **indexnow-ping**：部署后 POST 所有 URL 到 IndexNow，让 Bing/Copilot 即时收录。
+- **indexnow-ping**：部署后 POST 变更 URL 到 IndexNow；接收提交不等于抓取、收录或 AI 引用。
 
 **生产实战教训（已写进工具 references）：** 某 staging 域开了 CDN 平台的 "Managed robots / AI Crawl Control"，它在 Worker 输出**之前**注入一段把 GPTBot/ClaudeBot 等全 `Disallow` 的规则——直接架空"欢迎 AI 爬虫"策略。两条铁律：①生产域**永远别开**这开关；②调 robots **只在生产域验证**（staging 显示的是平台注入版）。
 
@@ -78,18 +80,18 @@ errors: 0   warnings: 45   heuristic score: 78/100
 errors: 0   warnings: 0
 ```
 
-线上 **0 错误 0 警告**：AI 爬虫全放行、llms.txt 在线、首页 ship 完整嵌套 @graph、安全/缓存头齐全。这就是"GEO 做到位"的样板。
+该次线上审计为 **0 错误 0 警告**：当时检测到相关 UA 根路径未被阻止、llms.txt 在线、首页 ship 完整嵌套 @graph、安全/缓存头齐全。这只能证明检测项的当时状态，不证明 AI 收录或推荐效果。
 
 ---
 
 ## 三、可迁移到任何项目的 7 条精华
 
 1. **把 SEO 底线变成 build 门禁**，别靠人记、别靠事后查——CI 红是最强约束。
-2. **canonical 构建期烤入、一份产物绑一个域**，绝不运行期算、绝不跨域复用。
+2. **canonical 最终输出必须正确稳定。** 静态站可构建期烤入并绑定域；服务端运行时生成也可行，合法联合发布也可能使用跨域 canonical。
 3. **图片预算查产物字节**：每张 ≤500KB + 现代格式 + 尺寸属性 + 懒加载，hero 单独 `fetchpriority=high`。
-4. **严格 CSP `script-src 'self'`**：JS 全外链、删 inline script / `on*=`、字体资源全自托管。
-5. **结构化数据用嵌套 @graph + 稳定 @id**，全站 Organization+WebSite 打底，`knowsAbout` 写准。
-6. **GEO 三件套**：robots 显式放行 AI 爬虫 + `llms.txt` + 部署 ping IndexNow。
+4. **按风险设计 CSP 与资源策略**：该站选择 JS 外链和资源自托管，其他站应按安全、隐私、性能和平台约束取舍。
+5. **结构化数据准确匹配可见内容**；嵌套 @graph、全站 Organization+WebSite 和 `knowsAbout` 是该站实现选择。
+6. **AI 搜索分层策略**：按搜索/训练/用户触发用途决定爬虫策略；`llms.txt` 为可选实验；IndexNow 只覆盖采用该协议的搜索引擎。
 7. **robots 只信生产域**：警惕平台层注入的 Managed robots 静默屏蔽 AI。
 
 > 想直接动手：用 `../scripts/audit-seo.mjs` 和 `audit-live.mjs` 对你的站跑一遍，对照 `../references/hard-gates.md` 逐条修。

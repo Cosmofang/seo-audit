@@ -7,12 +7,15 @@
 // `_site/`, or a plain folder of HTML.
 //
 //   node audit-seo.mjs [--dir dist] [--strict] [--max-page-kb 500]
-//                      [--max-img-kb 500] [--json]
+//                      [--max-img-kb 500] [--expected-origin https://example.com]
+//                      [--json]
 //
 // Severity model:
-//   ERROR — genuinely hurts ranking / breaks crawlers / fails Core Web Vitals.
+//   ERROR — a broken implementation with high crawl/index or canonical risk.
 //           Exits 1 (CI gate).
-//   WARN  — best-practice miss; review. With --strict, warns become errors.
+//   WARN  — a heuristic, accessibility/performance concern, or team guardrail.
+//           It is not automatically a Google ranking requirement. With
+//           --strict, warnings also fail CI by deliberate project policy.
 //
 // No npm install. Pure Node >=18 (uses fs, path, no external HTML parser —
 // regex extraction is intentionally conservative and good enough for audit
@@ -34,6 +37,13 @@ const STRICT = flag('strict');
 const JSON_OUT = flag('json');
 const MAX_PAGE = Number(opt('max-page-kb', '500')) * 1024;
 const MAX_IMG = Number(opt('max-img-kb', '500')) * 1024;
+const EXPECTED_ORIGIN_RAW = opt('expected-origin', '');
+let EXPECTED_ORIGIN = null;
+try { if (EXPECTED_ORIGIN_RAW) EXPECTED_ORIGIN = new URL(EXPECTED_ORIGIN_RAW).origin; }
+catch {
+  console.error(`✗ invalid --expected-origin: ${EXPECTED_ORIGIN_RAW}`);
+  process.exit(2);
+}
 
 const IMG_EXT = new Set(['.webp', '.avif', '.jpg', '.jpeg', '.png', '.gif', '.svg']);
 const SCRIPT_TYPE_ALLOW = new Set(['application/ld+json', 'application/json', 'importmap']);
@@ -71,6 +81,13 @@ function allTags(html, tag) {
   return html.match(tagOpenRe(tag)) || [];
 }
 
+function builtPagePath(rel) {
+  const normalized = rel.replaceAll('\\', '/');
+  if (normalized === 'index.html') return '/';
+  if (normalized.endsWith('/index.html')) return `/${normalized.slice(0, -'index.html'.length)}`;
+  return `/${normalized}`;
+}
+
 // strip <head>..</head>? no — we scan whole doc; fine for these checks.
 
 // ---- per-page checks ------------------------------------------------------
@@ -81,9 +98,10 @@ function auditHtml(file, html) {
   // for them but still enforce h1/viewport/semantic/perf hygiene.
   const isErrorPage = /(^|\/)(404|50\d)\.html$/i.test(rel);
 
-  // 1) exactly one <h1>
+  // 1) heading clarity. One H1 is a useful team convention, not a Google rule.
   const h1 = countTag(html, 'h1');
-  if (h1 !== 1) add(rel, 'error', 'h1', `expected exactly 1 <h1>, got ${h1}`);
+  if (h1 === 0) add(rel, 'warn', 'h1', 'no <h1>; provide a clear visible primary heading');
+  else if (h1 > 1) add(rel, 'warn', 'h1', `${h1} <h1> elements; review heading clarity and accessibility`);
 
   // 2) viewport meta
   const metas = allTags(html, 'meta');
@@ -95,16 +113,16 @@ function auditHtml(file, html) {
       add(rel, 'error', 'viewport', `viewport content invalid: "${c}"`);
   }
 
-  // 3) semantic landmarks
+  // 3) semantic landmarks (accessibility and maintainability convention)
   for (const t of ['main', 'nav', 'footer'])
-    if (!hasTag(html, t)) add(rel, 'error', 'semantic', `missing <${t}>`);
+    if (!hasTag(html, t)) add(rel, 'warn', 'semantic', `missing <${t}> landmark`);
 
   // 4) <title>
   const titleM = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const title = titleM ? titleM[1].replace(/\s+/g, ' ').trim() : '';
   if (!title) add(rel, 'error', 'title', 'missing or empty <title>');
   else if (title.length < 10 || title.length > 60)
-    add(rel, 'warn', 'title', `title length ${title.length} (aim 10–60 chars)`);
+    add(rel, 'warn', 'title', `title length ${title.length}; inspect rendered SERP (no fixed Google character limit)`);
 
   // 5) meta description
   const desc = metas.find((m) => /name\s*=\s*["']?description/i.test(m));
@@ -112,7 +130,7 @@ function auditHtml(file, html) {
   else {
     const c = (attr(desc, 'content') || '').trim();
     if (c.length < 50 || c.length > 160)
-      add(rel, 'warn', 'description', `description length ${c.length} (aim 50–160 chars)`);
+      add(rel, 'warn', 'description', `description length ${c.length}; review usefulness and likely truncation (not a ranking limit)`);
   }
 
   // 6) canonical
@@ -121,8 +139,18 @@ function auditHtml(file, html) {
   if (!canon) { if (!isErrorPage) add(rel, 'error', 'canonical', 'missing <link rel="canonical">'); }
   else {
     const href = attr(canon, 'href') || '';
-    if (!/^https?:\/\//i.test(href))
+    if (!/^https?:\/\//i.test(href)) {
       add(rel, 'error', 'canonical', `canonical href must be absolute: "${href}"`);
+    } else {
+      const canonicalUrl = new URL(href);
+      if (EXPECTED_ORIGIN && canonicalUrl.origin !== EXPECTED_ORIGIN) {
+        add(rel, 'error', 'canonical-host', `canonical origin ${canonicalUrl.origin} does not match ${EXPECTED_ORIGIN}`);
+      }
+      const expectedPath = builtPagePath(rel);
+      if (canonicalUrl.pathname !== expectedPath) {
+        add(rel, 'warn', 'canonical-path', `canonical path ${canonicalUrl.pathname} differs from built page path ${expectedPath}; confirm intentional duplicate mapping`);
+      }
+    }
   }
 
   // 7) Open Graph minimum
@@ -137,9 +165,9 @@ function auditHtml(file, html) {
   for (const img of allTags(html, 'img')) {
     const src = attr(img, 'src') || '(no src)';
     if (!hasAttr(img, 'width') || !hasAttr(img, 'height'))
-      add(rel, 'error', 'img-dims', `<img> missing width/height — CLS risk (${src})`);
+      add(rel, 'warn', 'img-dims', `<img> missing width/height — CLS risk (${src})`);
     if (attr(img, 'alt') === null)
-      add(rel, 'error', 'img-alt', `<img> missing alt (${src})`);
+      add(rel, 'warn', 'img-alt', `<img> missing alt attribute; use descriptive text or alt="" for decoration (${src})`);
     const loading = (attr(img, 'loading') || '').toLowerCase();
     const fetchpri = (attr(img, 'fetchpriority') || '').toLowerCase();
     const isHero = loading === 'eager' || fetchpri === 'high';
@@ -201,7 +229,7 @@ function auditHtml(file, html) {
     if (/rel\s*=\s*["']?stylesheet/i.test(l)) addLocal(attr(l, 'href'));
   for (const s of allTags(html, 'script')) addLocal(attr(s, 'src'));
   if (total > MAX_PAGE)
-    add(rel, 'error', 'page-weight', `HTML+CSS+JS = ${(total / 1024).toFixed(0)} KB > ${(MAX_PAGE / 1024).toFixed(0)} KB budget`);
+    add(rel, 'warn', 'page-weight', `HTML+CSS+JS = ${(total / 1024).toFixed(0)} KB > ${(MAX_PAGE / 1024).toFixed(0)} KB project budget`);
 }
 
 // ---- standalone CSS baseline (font-size floor) ----------------------------
@@ -247,7 +275,7 @@ const errors = findings.filter((f) => f.sev === 'error');
 const warns = findings.filter((f) => f.sev === 'warn');
 
 if (JSON_OUT) {
-  console.log(JSON.stringify({ dir: DIR, scanned: { html: nHtml, css: nCss, img: nImg }, errors, warns }, null, 2));
+  console.log(JSON.stringify({ dir: DIR, expectedOrigin: EXPECTED_ORIGIN, scanned: { html: nHtml, css: nCss, img: nImg }, errors, warns }, null, 2));
 } else {
   const byFile = {};
   for (const f of findings) (byFile[f.file] ||= []).push(f);
@@ -257,12 +285,9 @@ if (JSON_OUT) {
     for (const f of fs.sort((a, b) => (a.sev === b.sev ? 0 : a.sev === 'error' ? -1 : 1)))
       console.log(`  ${icon(f.sev)} [${f.rule}] ${f.msg}`);
   }
-  // Rough heuristic score: errors dominate; warns nudge. Repeated soft
-  // advisories (e.g. long titles across many pages) shouldn't crater it.
-  const score = Math.max(0, Math.round(100 - errors.length * 8 - warns.length * 0.5));
   console.log(`\n${'─'.repeat(56)}`);
   console.log(`scanned: ${nHtml} html · ${nCss} css · ${nImg} images`);
-  console.log(`errors: ${errors.length}   warnings: ${warns.length}   heuristic score: ${score}/100`);
+  console.log(`errors: ${errors.length}   warnings: ${warns.length}`);
   if (nHtml === 0) console.log('note: 0 HTML files found — is --dir pointing at the build output?');
 }
 
