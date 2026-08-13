@@ -2,6 +2,25 @@
 
 All notable changes to the `seo-audit` skill. Versioning follows [semver](https://semver.org/): MAJOR = breaking change to script CLI/output contract, MINOR = new capability/reference, PATCH = fixes/copy.
 
+## [2.0.0] — 2026-08-13
+
+### Added
+- Full SEO operations knowledge base: strategy/KPIs, keyword and SERP research, content/on-page, information architecture, technical SEO, ecommerce/Shopify, international/local, authority/digital PR, monitoring/recovery, and AI search.
+- Execution playbooks for a 90-day program, site audits, content briefs/publishing, and site migrations.
+- Evidence levels, official-source register, a myth/non-rule decision guide, and automated tests.
+
+### Changed
+- Reframed the original “hard gates” as implementation errors, recommendations, project guardrails, or experiments.
+- Added `--expected-origin` canonical host validation to the build auditor.
+- Added built-file to canonical-path comparison and live homepage canonical value validation.
+- Live robots reporting now separates explicit, inherited, blocked, and unspecified AI-crawler policies.
+- Missing `llms.txt` and optional homepage schema are informational rather than SEO warnings.
+- Missing `robots.txt` is informational because absence does not block crawling; removed the synthetic heuristic score.
+- The skill now routes complete SEO work instead of excluding keywords, content, links, and measurement.
+
+### Corrected
+- Removed unsupported universal claims about title/description/word-count limits, H1 dilution, external-link `nofollow`, self-hosting, Organization/WebSite markup, and direct GEO effects from `knowsAbout` or `llms.txt`.
+
 ## [1.1.0] — 2026-06-10
 
 Iterated via the `automatic-skill` pipeline (review → SEO → self-check → safety check).

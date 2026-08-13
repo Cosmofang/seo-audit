@@ -1,9 +1,15 @@
-# Structured data (JSON-LD) recipes
+# 结构化数据实现参考
 
-JSON-LD is the highest-leverage GEO move after being crawlable: it's how Google rich results **and** LLMs reliably extract entities and facts. Emit it as `<script type="application/ld+json">` (a non-executable data block — allowed under strict CSP `script-src 'self'`, no nonce needed).
+## 决策顺序
 
-## The nested `@graph` pattern (use this)
-Ship **one** `<script type="application/ld+json">` per page containing a `@graph` array, rather than many separate blocks. Cross-link nodes with `@id` so machines see one connected entity graph. This is exactly what the reference site prod ships (verified: `Organization, WebSite, FAQPage, WebPage, Service, Product, SoftwareApplication…` in a single graph).
+1. 页面可见内容是否真实存在相应实体？
+2. Google 的 [structured data gallery](https://developers.google.com/search/docs/appearance/structured-data/search-gallery) 是否支持需要的搜索功能？
+3. 逐项满足该类型 required/recommended properties 和内容政策。
+4. Rich Results Test 验 Google 资格，Schema Validator 验词汇，Search Console 看实际表现。
+
+JSON-LD 通常最易维护，但不是唯一格式。单 block、多个 block 或 `@graph` 都可；稳定 `@id` 和连接实体是工程便利，不是排名要求。
+
+## 通用 `@graph` 示例
 
 ```html
 <script type="application/ld+json">
@@ -15,76 +21,32 @@ Ship **one** `<script type="application/ld+json">` per page containing a `@graph
       "@id": "https://www.example.com/#organization",
       "name": "Example",
       "url": "https://www.example.com/",
-      "logo": { "@type": "ImageObject", "url": "https://www.example.com/logo.png", "width": 200, "height": 200 },
-      "image": "https://www.example.com/og-image.png",
-      "description": "One-sentence what-you-do, entity-rich.",
-      "sameAs": ["https://www.linkedin.com/company/example/", "https://x.com/example"],
-      "knowsAbout": ["Topic A", "Topic B", "Topic C"]
+      "logo": "https://www.example.com/logo.png",
+      "sameAs": ["https://www.linkedin.com/company/example/"]
     },
     {
       "@type": "WebSite",
       "@id": "https://www.example.com/#website",
-      "name": "Example",
       "url": "https://www.example.com/",
-      "publisher": { "@id": "https://www.example.com/#organization" }
-    },
-    {
-      "@type": "WebPage",
-      "@id": "https://www.example.com/some-page/#webpage",
-      "url": "https://www.example.com/some-page/",
-      "name": "Page title",
-      "isPartOf": { "@id": "https://www.example.com/#website" },
-      "about": { "@id": "https://www.example.com/#organization" }
+      "name": "Example",
+      "publisher": {"@id": "https://www.example.com/#organization"}
     }
   ]
 }
 </script>
 ```
 
-## Rules
-- **Site-wide:** `Organization` + `WebSite` on every page (the auditor warns if either is missing on the homepage).
-- **Absolute URLs everywhere** — `@id`, `url`, `logo`, `item`. Build them from the same `PUBLIC_SITE_ORIGIN` used for canonical, at build time.
-- **`@id` discipline:** stable fragment IDs (`/#organization`, `/#website`) so other nodes reference them instead of duplicating.
-- **Match visible content.** JSON-LD that contradicts the page is a spam signal. Don't markup FAQs/reviews that aren't on the page.
-- **Validate:** validator.schema.org and Google Rich Results Test before shipping.
+只在最相关页面输出所需实体即可；Organization/WebSite 不必机械地每页重复。`knowsAbout` 可准确描述组织知识领域，但没有可靠证据证明它直接提升 LLM 推荐。
 
-## `knowsAbout` (the GEO multiplier)
-On `Organization`, list the topics/entities you want to be associated with. This directly feeds how LLMs decide what your brand is "about" and when to recommend it. the reference site lists: `Agentic commerce, AI shopping agents, Generative engine optimization, AI search optimization, Product schema, Structured data, llms.txt, AI referral traffic`. Pick 6–10 real, specific topics — not keyword stuffing.
+## 页面类型
 
-## Per-page type recipes (add to the `@graph`)
+- `BreadcrumbList`：与可见层级一致。
+- `Article`/`BlogPosting`：真实作者、发布时间、实质修改时间、图片和 publisher。
+- `Product`：名称、图片、描述、brand、offer/aggregateOffer；价格、币种、库存、variant、评价必须和页面一致。
+- `LocalBusiness`：选择准确 subtype，地址/营业时间/电话与真实业务一致。
+- `VideoObject`、`Event`、`Recipe` 等：只按对应官方指南实现。
+- `FAQPage`：仅标记页面可见问答；有效 schema 不是排名因素。Google 的 FAQ 富结果通常仅对符合条件的权威政府/健康站点开放。
 
-**Breadcrumb** — emit on every non-home page; also render a visible breadcrumb.
-```json
-{ "@type": "BreadcrumbList", "itemListElement": [
-  { "@type": "ListItem", "position": 1, "name": "Home", "item": "https://www.example.com/" },
-  { "@type": "ListItem", "position": 2, "name": "Guides", "item": "https://www.example.com/guides/" },
-  { "@type": "ListItem", "position": 3, "name": "This page", "item": "https://www.example.com/guides/this/" }
-] }
-```
+## 禁止做法
 
-**Article / BlogPosting** — for blog/editorial.
-```json
-{ "@type": "BlogPosting", "@id": ".../post/#article", "headline": "…", "description": "…",
-  "datePublished": "2026-01-01", "dateModified": "2026-01-02",
-  "author": { "@type": "Person", "name": "…" },
-  "publisher": { "@id": "https://www.example.com/#organization" },
-  "mainEntityOfPage": { "@id": ".../post/#webpage" } }
-```
-
-**Product** — for ecommerce/product pages.
-```json
-{ "@type": "Product", "name": "…", "image": ["https://…/p.jpg"], "description": "…",
-  "brand": { "@type": "Brand", "name": "…" },
-  "offers": { "@type": "Offer", "price": "29.00", "priceCurrency": "USD",
-    "availability": "https://schema.org/InStock", "url": "https://…/product/" } }
-```
-
-**FAQPage** — only if the Q&A is actually rendered on the page.
-```json
-{ "@type": "FAQPage", "mainEntity": [
-  { "@type": "Question", "name": "Q?", "acceptedAnswer": { "@type": "Answer", "text": "A." } }
-] }
-```
-
-## Reference implementation
-the reference site builds these in `apps/web/src/lib/seo.ts` (`buildOrganizationJsonLd`, `buildWebsiteJsonLd`, `buildBreadcrumbJsonLd` — the last rejects a trailing-slash origin and a non-`/` path so canonical/`@id` URLs are always well-formed) and renders via a `JsonLd.astro` component wired into the base layout + per-route `jsonLd` fields.
+隐藏/不存在内容、虚假评价、错误价格库存、自评星级滥用、批量给所有页面套 FAQ/Product、仅为了占 SERP 而标无关实体。结构化数据有效不代表一定展示富结果。

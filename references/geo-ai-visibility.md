@@ -1,99 +1,41 @@
-# GEO — Generative Engine Optimization (AI / LLM visibility)
+# AI 搜索可见性实现参考
 
-GEO = being found, cited, and **recommended** by AI assistants (ChatGPT, Claude, Perplexity, Gemini, AI Overviews). Classic SEO gets you into Google's index; GEO gets you into the model's answer. The two share a foundation (crawlable, structured, fast) but GEO adds three things: **let the AI crawlers in**, **give them an AI-readable map (`llms.txt`)**, and **describe your entity in schema (`knowsAbout`)**.
+本文件提供实现细节，策略与证据边界以 [GEO 与 AI 搜索](../knowledge/geo-and-ai-search.md) 为准。最后核验：2026-08-13。
 
-> Strategic stance: if your business depends on AI discovery, you *want* AI crawlers. The common reflex of blocking GPTBot/CCBot to "protect content" directly removes you from the systems that recommend products. Decide deliberately.
+## OpenAI 爬虫用途
 
----
+依据 [OpenAI crawlers](https://developers.openai.com/api/docs/bots)：
 
-## 1. robots.txt — explicitly allow the AI crawlers
-Default `User-agent: *` rules don't reliably cover AI bots, and some managed robots presets **block them by default**. Allow them explicitly. Exact user-agents that matter (2026):
+- `OAI-SearchBot`：ChatGPT Search 自动搜索抓取；希望出现在搜索答案时应允许，并配合官方 IP 范围/WAF。
+- `GPTBot`：可能用于基础模型训练；可独立允许或阻止。
+- `ChatGPT-User`：用户操作触发，不用于自动搜索索引；robots 规则可能不适用。
 
-| Operator | Crawl/Train | Search | User-initiated fetch |
-|---|---|---|---|
-| OpenAI | `GPTBot` | `OAI-SearchBot` | `ChatGPT-User` |
-| Anthropic | `ClaudeBot` | `Claude-SearchBot` | `Claude-User` |
-| Perplexity | — | `PerplexityBot` | `Perplexity-User` |
-| Google AI | `Google-Extended` (training control token) | (Googlebot for AI Overviews) | — |
-| Common Crawl | `CCBot` (feeds many open models) | — | — |
-| Others | `Bytespider`, `Amazonbot`, `Applebot-Extended` | | |
+不要把三者写成一个“全放行或全阻止”开关。Anthropic、Perplexity、Google 等也应以各自最新官方说明为准。
 
-Template (production):
-```
+```text
+User-agent: OAI-SearchBot
+Allow: /
+
+User-agent: GPTBot
+Disallow: /
+
 User-agent: *
 Allow: /
 Disallow: /admin/
-Disallow: /api/admin/
-
-User-agent: GPTBot
-Allow: /
-User-agent: OAI-SearchBot
-Allow: /
-User-agent: ChatGPT-User
-Allow: /
-User-agent: ClaudeBot
-Allow: /
-User-agent: Claude-SearchBot
-Allow: /
-User-agent: Claude-User
-Allow: /
-User-agent: PerplexityBot
-Allow: /
-User-agent: Google-Extended
-Allow: /
 
 Sitemap: https://www.example.com/sitemap.xml
 ```
-`audit-live.mjs` reports which of these are allowed vs blocked.
 
-**Pitfalls (learned in prod):**
-- Some platforms (e.g. Cloudflare "AI Crawl Control / Managed robots.txt") **inject their own robots rules ahead of your origin's**, silently `Disallow:` the AI bots, and override what your app serves. This is a zone/dashboard toggle your code can't see. **Verify robots policy on the real production origin**, not a staging domain (staging often shows the injected version). Never enable a managed "block AI" preset on the domain you want AI traffic to.
-- Staging/dev should be `Disallow: /` (don't index pre-prod). Branch robots by environment.
+这只是示例策略，不是法律建议。生产环境同时验证 app、CDN/WAF 和日志。`audit-live.mjs` 只总结根路径策略，不是完整 robots parser。
 
-## 2. `llms.txt` — an AI-readable site map
-A Markdown file at `/llms.txt`: a curated, sectioned index of your authoritative pages so an LLM can orient without crawling everything. Order sections by importance; exclude noise (legal, pure lead-capture forms).
+## `llms.txt` 实验
 
-```
-# Example
+若决定测试，可在 `/llms.txt` 提供短的 Markdown 导航：品牌/产品说明、起始页、概念、研究和支持资源。只列公开 canonical URL，从 route/content source 生成并记录日志/引用/referral。其缺失不是 SEO/GEO 错误。
 
-> One-paragraph description of what the company/site is and does.
+## IndexNow
 
-## Start here
-- [Home](https://www.example.com/): what we do in one line
-- [Product](https://www.example.com/product/): the core offering
+按 [IndexNow documentation](https://www.indexnow.org/documentation) 托管密钥并提交新增、更新、删除 URL；批量单次上限 10,000。HTTP 200/202 只表示接收/待验证，不表示抓取、索引、排名或 AI 引用。它不替代 Google sitemap/GSC 流程。
 
-## Concepts & definitions
-- [Glossary term](https://www.example.com/glossary/term/): short gloss
+## 可引用内容
 
-## Research & resources
-- [Whitepaper](https://www.example.com/whitepapers/x/): what it covers
-- [Blog post](https://www.example.com/blog/y/): what it covers
-
-## Industry guides
-- [Guide](https://www.example.com/industries/z/): who it's for
-```
-Generate it from your route table (same source as the sitemap) so it never drifts. `audit-live.mjs` checks `/llms.txt` exists and is non-empty.
-
-## 3. Entity schema — `knowsAbout`
-See `structured-data.md`. The `Organization.knowsAbout` array is the most direct lever on "what does the model think this brand is about" — list 6–10 specific topics you want to be recommended for.
-
-## 4. IndexNow — push freshness on deploy
-IndexNow tells Bing/Yandex (and via Bing, Copilot) about new/changed URLs instantly instead of waiting for a crawl. One-time: host a key file at `/{key}.txt`. On each deploy, POST changed URLs:
-```
-POST https://api.indexnow.org/indexnow
-Content-Type: application/json; charset=utf-8
-{ "host": "www.example.com", "key": "<key>",
-  "keyLocation": "https://www.example.com/<key>.txt",
-  "urlList": ["https://www.example.com/page/", ...] }
-```
-200/202 = accepted. Wire it into the deploy pipeline (reference: `indexnow-ping.mjs`, run post-deploy with all routes).
-
-## 5. Content shape for AI extraction
-Beyond infra, LLMs preferentially quote content that is:
-- **Direct and factual** — lead with the answer, then elaborate (inverted pyramid). LLMs extract the first clear statement.
-- **Well-structured** — real headings, lists, tables, definitions. A glossary/FAQ page is highly quotable.
-- **Self-contained** — each page answers one question fully; don't require reading three pages to get the point.
-- **Entity-explicit** — name the product/brand/category in text, not just images, so retrieval and attribution work.
-
-## What "good GEO" looks like (the reference site prod, verified)
-robots allows GPTBot/OAI-SearchBot/ChatGPT-User/ClaudeBot/Claude-User/Claude-SearchBot/PerplexityBot/Perplexity-User/Google-Extended/GoogleOther · declares Sitemap · `/llms.txt` present · homepage `@graph` ships Organization+WebSite+FAQPage+Service+Product+SoftwareApplication · HSTS + `Vary: User-Agent` headers. Run `audit-live.mjs <origin>` and aim for the same.
+清晰回答、原始来源、稳定 URL、作者/品牌实体、发布日期/更新时间、可复制表格和真实产品事实有利于机器与用户理解。把 AI 引用当可观测结果，不要宣称超长 meta、`knowsAbout` 或单一 schema 结构有直接推荐因果。
