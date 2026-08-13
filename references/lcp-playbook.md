@@ -2,21 +2,30 @@
 
 Distilled from a production campaign on the reference site (mobile PageSpeed LCP 7.5 s baseline → ~1.5 s field / ~0.9–1.2 s lab). Every lever below shipped and was **measured before/after** under the same lab conditions. Use this when the audit (or PageSpeed) says LCP is the problem; gates alone won't fix a slow LCP.
 
+The measured gains belong to that site, page set, hosting path and test profile. Use the sequence as a diagnosis playbook, not a promise that the same change produces the same improvement elsewhere.
+
+## Contents
+
+- Diagnose before changing code
+- Measured levers, ranked by impact on the reference site
+- CLS guardrails
+- CI and field-data lock-in
+
 ---
 
 ## 0. Diagnose before touching anything
 
 1. **Identify the actual LCP element** (DevTools Performance panel / PSI "LCP element"). It is often **text**, not an image — here it was the hero subtitle paragraph. Text-LCP and image-LCP have different fixes; don't optimize images when the LCP is a `<p>`.
 2. **Break LCP into its 4 phases** — TTFB → resource load delay → resource load time → **render delay**. This campaign was render-delay-bound: the fixes are CSS/fonts/DOM, not bytes-on-the-wire.
-3. **Measure with DevTools *applied* throttling** (4× CPU + Slow 4G), median of 3 runs, same local server. **Not Lantern/simulated** — Lantern on a localhost static server reported ~4 s when real-throttle measured ~1 s. Chasing the simulated number leads to wrong fixes.
-4. **Don't chase the PSI score.** Verify each change with the lab setup above; PSI's simulated mobile number can lag/over-penalize while real users are already fast.
+3. **Choose one repeatable lab profile** and use a median of at least 3 runs. The reference campaign used DevTools applied throttling (4x CPU + Slow 4G) because Lantern simulation on its localhost server diverged materially from traces. Simulated testing remains useful when calibrated against field data; do not switch methods mid-comparison.
+4. **Do not optimize a composite score in isolation.** Verify each change in traces and compare with CrUX/RUM when available. Lab and field results answer different questions.
 
 ---
 
 ## The levers, ranked by measured impact
 
 ### 1. Kill render-blocking CSS round-trips (~1.7 s)
-Multiple `<link rel="stylesheet">` in `<head>` = serial round-trips before first paint. Inline the CSS into the HTML (Astro: `build.inlineStylesheets: 'always'`).
+On the reference site, multiple stylesheet requests were on the render path. Inlining removed those round-trips (Astro: `build.inlineStylesheets: 'always'`). This trades away shared-cache reuse and increases HTML, so measure multi-page/repeat navigation before adopting it globally.
 - CSP note: inline `<style>` needs `style-src 'unsafe-inline'` (low risk); keep **scripts** external and strict.
 - Pitfall: bundlers name shared CSS chunks after the first entry alphabetically — a chunk called `electronics.*.css` was actually the site-wide fonts/nav/footer CSS. Inspect chunk *bodies* before deciding what to cut.
 
@@ -43,8 +52,8 @@ A decorative hero mockup (~140 nodes of gradients/shadows/transforms) was laid o
 ### 5. Image-LCP pages: eager hero, lazy everything else
 Where the LCP *is* an image: `loading="eager"` + `fetchpriority="high"` on it (a lazy-loaded hero cost one page 3.2 s → fixed to <2.5 s), `loading="lazy"` on all others, AVIF with WebP fallback, responsive `widths`/`sizes` so mobile never downloads desktop pixels, recompress anything near the 500 KB gate. (Overlaps gate 7 — the playbook point is *which* image gets priority.)
 
-### 6. Third-party JS: idle or first-interaction, never `<head>`
-Analytics/GTM injected on `requestIdleCallback` or first interaction (`pointerdown`/`keydown`/`touchstart`), with a queueing `dataLayer` so no events are lost. Always after LCP, by construction.
+### 6. Third-party JS: keep nonessential code off the critical path
+The reference site injected analytics on `requestIdleCallback` or first interaction (`pointerdown`/`keydown`/`touchstart`), with a queueing `dataLayer`. Consent, attribution and event-loss requirements differ by site; verify them rather than assuming deferral is free.
 
 ### 7. Below-fold JS init: idle + IntersectionObserver
 Defer widget initialization (accordions, carousels) to `requestIdleCallback`, or an `IntersectionObserver` with `rootMargin: '200px'` — the framework-free equivalent of `client:visible`. Init work stops competing with the hero render. Also: cache `getBoundingClientRect` results instead of reading per-mousemove; rAF-coalesce resize handlers.
@@ -69,6 +78,7 @@ Every deferral trades paint order for layout risk. Rules that kept CLS at 0 thro
 
 ## Lock it in (CI) — wins evaporate without gates
 
-- **Lighthouse CI gate**: mobile, **devtools throttling** (not Lantern — see §0.3), hard assertions `LCP < 2.5 s` / `CLS < 0.1` on the heaviest pages, median of 3 runs. Keep TBT advisory until you have a stable baseline (it's the noisiest metric in CI).
+- **Lighthouse CI gate**: mobile, using the calibrated lab method selected in diagnosis, with hard assertions `LCP < 2.5 s` / `CLS < 0.1` on representative heavy pages and a median of 3 runs. Keep TBT advisory until the environment has a stable baseline.
 - **Per-page external-JS byte budget** (reference site: ≤40 KB/page, worst page 23.5 KB) — catches "a new dependency crept onto the page" before it reaches the field. Don't raise the threshold to pass; defer or cut the JS.
 - These complement gate 10 (500 KB total): the JS budget is the dedicated regression tripwire for the metric that actually moves LCP/INP.
+- Track field LCP, INP and CLS by template, device and geography. CI catches regressions before release; it cannot represent every real user.

@@ -1,114 +1,110 @@
-# SEO / GEO 体检 + 优化工具包
+# SEO / GEO Audit and Operations
 
-> 一套**可执行的网站 SEO + GEO（AI 可见性）审计工具**，从 example.com 官网"跑分高"的工程硬约束里提炼而成。
-> 给团队任何人用：可以当 Claude skill 调用，也可以纯命令行独立跑（只需 Node，零依赖、零安装）。
+DeepLumen 官网技术 SEO、国际化 SEO、AI 可见性（GEO）、Core Web Vitals 与发布运维体系的公开整理版。
 
-跑分高不是玄学——参考生产站的构建流水线里挂了 10 个**硬门禁**，任何一条不达标就 **build 失败**，逼着每个页面都满足 SEO/性能/可访问性底线；再叠一层 **GEO（让 ChatGPT / Claude / Perplexity / Gemini 能爬、能引、能推荐你）**。这个包把那套规则抽象成框架无关的工具，能对任意网站跑一遍、报问题、给修法。
+这个仓库同时提供：
 
-实测：用本包审 example.com 生产站 → **构建产物 0 错误、线上 0 错误 0 警告**（14 个 AI 爬虫全放行、llms.txt 在线、JSON-LD 是 Organization+WebSite+Product+… 的嵌套 @graph）。
+- 两个零依赖 Node.js 审计器：本地构建产物审计 + 线上 origin 审计。
+- 一套可落地的 SEO/GEO 工程规范和发布 Runbook。
+- 从 DeepLumen 生产官网提炼的架构模式、构建门禁与实测性能经验。
+- 一个可安装到 Claude Code、Codex、Cursor 等工具中的 `seo-audit` skill。
 
----
+仓库不包含官网业务源码、账号、密钥、客户数据或私有运营数据。示例已泛化，官网内容仍以其 canonical URL 为唯一原文来源。
 
-## 文件夹结构
+## 快速开始
 
-```
-seo-audit/                 ← 这个目录本身就是 seo-audit skill（可直接拷进 ~/.claude/skills/）
-├── SKILL.md               ← skill 说明 + 4 步工作流 + 12 门禁速查
-├── README.md              ← 你正在看的这份（上手入口）
-├── scripts/
-│   ├── audit-seo.mjs      ← 扫「构建产物目录」：12 项硬门禁
-│   └── audit-live.mjs     ← 扫「线上 origin」：robots/AI 爬虫 / sitemap / llms.txt / JSON-LD / 安全头
-├── references/
-│   ├── hard-gates.md          ← 12 门禁：精确阈值 + 为什么 + 通用修法 + Astro/CF 参考实现
-│   ├── structured-data.md     ← JSON-LD（@graph 嵌套）配方：Org/WebSite/面包屑/Article/Product/FAQ
-│   ├── geo-ai-visibility.md   ← GEO 招牌层：AI 爬虫精确 UA 白名单 / llms.txt / knowsAbout / IndexNow
-│   └── lcp-playbook.md        ← LCP 实战手册：参考站移动端 7.5s → 1.5s 的全部实测杠杆 + CLS 护栏 + CI 锁定
-└── analysis/
-    └── case-study-build-time-seo-gates.md   ← 深度分析：跑分高的根因 + 生产站实测结果
-```
-
----
-
-## 用法一：命令行独立跑（推荐给开发同事，不需要 Claude）
-
-前置：**Node ≥ 18**（自带 `fetch`）。无需 `npm install`，两个脚本零外部依赖。
-
-### 1) 审计构建产物（本地 / CI 都行）
-先把站点 build 出来，拿到产物目录（Astro `dist/`、Next `out/`、Hugo `public/`、Jekyll `_site/`、或任意一堆 HTML），然后：
+要求 Node.js 18 或更高版本，无需 `npm install`。
 
 ```bash
-node scripts/audit-seo.mjs --dir <构建产物目录>
+# 审计构建产物
+node scripts/audit-seo.mjs --dir dist --origin https://www.example.com
 
-# 可选参数：
-#   --strict          把 warning 也当 error（CI 模式，有问题 exit 1）
-#   --json            输出 JSON（便于程序消费）
-#   --max-page-kb 500 单页 HTML+CSS+JS 预算（默认 500KB）
-#   --max-img-kb 500  单张图片预算（默认 500KB）
-```
+# 公开 alternate representation 仍接受审计，但允许 canonical 指向主页面
+node scripts/audit-seo.mjs --dir dist --origin https://www.example.com \
+  --alternate-prefix agent/
 
-输出里 `✗` = ERROR（真伤排名 / 卡爬虫 / 拖垮 Core Web Vitals，优先修），`⚠` = WARN（最佳实践没达到）。末尾有个粗略 score 当仪表盘看，不是 Lighthouse 分。
+# CI 模式：warning 也会导致非零退出码
+node scripts/audit-seo.mjs --dir dist --origin https://www.example.com --strict
 
-### 2) 审计线上站（GEO 那层只能在线上看）
-```bash
+# 审计线上站点
 node scripts/audit-live.mjs https://www.example.com
-```
-查：robots.txt 对各 AI 爬虫是放行还是拦截、有没有 sitemap、有没有 `llms.txt`、首页实际 ship 了哪些 JSON-LD `@type`、HSTS / Vary / Cache-Control。
 
-> ⚠️ **robots 一定在「生产 origin」验证**：Cloudflare 等平台的 "Managed robots / AI Crawl Control" 会在你的源站之前注入自己的 robots，可能把 AI 爬虫静默 `Disallow`，而且 staging 域显示的往往是注入版不是你真正 ship 的版本。
-
-### 接进 CI（可选）
-```bash
-# 在 build 之后加一步，回归就让流水线红：
-node scripts/audit-seo.mjs --dir dist --strict
+# 机器可读输出
+node scripts/audit-seo.mjs --dir dist --origin https://www.example.com --json
+node scripts/audit-live.mjs https://www.example.com --json
 ```
 
----
+本地审计覆盖：
 
-## 用法二：作为 Claude / Cursor 的 skill
+- 每页唯一 H1、viewport、语义地标、title、description。
+- 绝对 canonical，以及传入 `--origin` 时的 host 与自指路径校验。
+- Open Graph、图片尺寸/alt/加载策略与图片体积。
+- inline 可执行脚本、inline 事件处理器、外部资源引用。
+- HTML + 同页 CSS/JS 体积预算，支持根路径和相对路径资源。
+- JSON-LD 解析、主页 Organization/WebSite、重复 title/description/canonical。
+- CSS 外链、`srcset` 外链与过小字体提示。
 
-把这个目录整个拷进自己的技能目录：
+线上审计覆盖：
 
-```bash
-cp -R . ~/.claude/skills/seo-audit
+- robots.txt、sitemap.xml、llms.txt。
+- 搜索索引 crawler、用户触发 fetcher、训练 crawler 的分组策略。
+- 首页 canonical、robots meta、JSON-LD 与基础响应头。
+- 线上错误时可靠的退出码，包括 `--json` 模式。
+
+这些检查是高信号技术基线，不替代 Search Console、Bing Webmaster Tools、真实用户 Core Web Vitals、日志分析、内容质量评估或人工验证。
+
+## 文档导航
+
+| 任务 | 文档 |
+|---|---|
+| 建立完整 SEO/GEO 工作流 | [`references/operating-model.md`](references/operating-model.md) |
+| 配置构建门禁 | [`references/hard-gates.md`](references/hard-gates.md) |
+| 路由、canonical、重定向与 sitemap | [`references/routing-canonical.md`](references/routing-canonical.md) |
+| 中英双语与 hreflang | [`references/international-seo.md`](references/international-seo.md) |
+| JSON-LD 与实体一致性 | [`references/structured-data.md`](references/structured-data.md) |
+| AI crawler、llms.txt、agents.md 与 GEO | [`references/geo-ai-visibility.md`](references/geo-ai-visibility.md) |
+| 白帽 AI 可读层与防 cloaking | [`references/whitehat-ai-readability.md`](references/whitehat-ai-readability.md) |
+| LCP / CLS / 性能预算 | [`references/lcp-playbook.md`](references/lcp-playbook.md) |
+| 上线、巡检、故障处理 | [`references/publishing-runbook.md`](references/publishing-runbook.md) |
+| 内容集群与发布规范 | [`references/content-system.md`](references/content-system.md) |
+| DeepLumen SEO/GEO 内容资产索引 | [`references/deeplumen-content-inventory.md`](references/deeplumen-content-inventory.md) |
+
+可直接改造成项目代码的最小参考实现位于 [`examples/reference-architecture/`](examples/reference-architecture/)；它包含路由、canonical/hreflang、结构化数据、robots、sitemap、Lighthouse 与 CI 示例。
+
+## 证据等级
+
+仓库中的建议分为三类，避免把实验性 GEO 结论写成搜索引擎规则：
+
+- **标准/平台文档支持**：canonical、hreflang、robots、sitemap、结构化数据语法、Core Web Vitals 等。
+- **工程策略**：单一路由源、字节预算、严格 CSP、自托管资源、CI 门禁等。它们能提升稳定性，但不是独立排名因子声明。
+- **实验/兼容层**：`llms.txt`、`agents.md`、Markdown 镜像、实体补充端点等。可以部署和测量，但不能承诺直接提升排名、引用或推荐。
+
+## CI 接入
+
+```yaml
+- name: Build
+  run: npm run build
+
+- name: SEO hard gate
+  run: node vendor/seo-audit/scripts/audit-seo.mjs --dir dist --origin https://www.example.com --strict
 ```
 
-之后在 Claude Code / Desktop / Cursor 里直接说：
-- "审计一下这个站的 SEO" / "帮我把 SEO 分提上去"
-- "让我的站能被 AI / ChatGPT 发现" / "加 llms.txt" / "修 robots 放行 AI 爬虫"
-- "加结构化数据 / JSON-LD" / "配 sitemap / canonical / Open Graph"
+CI 必须对错误的目录或零 HTML 构建失败。本仓库自带测试覆盖这些 fail-open 场景。
 
-它会自动定位构建产物、跑审计、按严重度报问题、对照 `references/` 给修法、改完再跑一遍确认。
+## Skill 安装
 
----
+将仓库放入工具的 skills 目录，或安装发布版本。`SKILL.md` 只保留工作流与按需加载索引，详细知识都在 `references/`，避免每次调用占用过多上下文。
 
-## 12 门禁速查
+## 边界
 
-| # | 门禁 | 底线 |
-|---|---|---|
-| 1 | `<h1>` 唯一 | 每页恰好 1 个 |
-| 2 | viewport meta | `width=device-width, initial-scale=1` |
-| 3 | 语义地标 | `<main>` + `<nav>` + `<footer>` |
-| 4 | title + description | 都要有（长度为软警告，GEO 可故意写长） |
-| 5 | canonical | 绝对 URL，host=部署域，**构建期**烤入（非运行时） |
-| 6 | Open Graph | `og:title` + `og:image` |
-| 7 | 图片 | 每张有 width/height/alt；非 hero `lazy`；hero `fetchpriority=high`；单张 ≤500KB |
-| 8 | 无 inline 可执行 script / 无 `on*=` | 走严格 CSP `script-src 'self'` |
-| 9 | 无外链资源 | 字体/图/CSS/JS 全自托管 |
-| 10 | 单页文本预算 | HTML+同页 CSS+JS ≤500KB（图片单独算） |
-| 11 | 结构化数据 | 全站 Organization + WebSite，按页加 Article/Product/FAQ |
-| 12 | URL 规范 | 全小写 / 尾斜杠 / ≤3 级 / 单一路由源 |
+仓库主要处理技术 SEO、国际化 SEO、站内内容结构、AI 可读性和性能。以下工作仍需要独立数据源：
 
-**GEO 层**：robots 显式放行主流 AI 爬虫 + ship `llms.txt` + `Organization.knowsAbout` 写清楚做什么 + 部署后 ping IndexNow。详见 `references/geo-ai-visibility.md`。
+- 关键词量级、排名与竞品份额。
+- Search Console 索引状态、抓取错误与人工处置。
+- 外链质量、品牌提及与数字公关。
+- GA4/CRM 收入归因、转化率和实验结果。
+- CrUX 真实用户数据与不同地区/设备表现。
 
-**性能层（LCP / Core Web Vitals）**：门禁全过但站还是慢？看 `references/lcp-playbook.md` —— 参考站移动端 LCP 7.5s → 1.5s 的实测杠杆，按影响排序：消灭 render-blocking CSS → 关键 CSS 拆分 → 字体 preload 纪律（无用 preload 反而占满关键路径）→ 延后首屏非 LCP 重 DOM → hero 图 eager + fetchpriority → 三方 JS 推迟到 idle/首次交互。核心方法论：先找到**真正的 LCP 元素**（常常是文字不是图），用 DevTools 实测节流（别信 Lantern 模拟值），每改一步都量一次，最后用 Lighthouse CI 门禁 + 单页 JS 字节预算把战果锁死。
+## License
 
-逐条「精确阈值 + 为什么 + 怎么修」看 `references/hard-gates.md`；想看跑分高的根因和实测看 `analysis/case-study-build-time-seo-gates.md`。
-
----
-
-## 原则
-
-- 别为了让审计过而放宽阈值——**修页面，不是改门禁**。
-- SEO 活在「渲染后的 HTML」里：审构建产物 / 线上页，不是审源码模板。
-- 修的时候改源（模板 / 布局 / 配置），别改构建产物（会被重新生成覆盖）。
-- 脚本用保守正则提取信号、不跑完整 DOM：**全绿是强证据，不是形式化保证**。
+[MIT](LICENSE)

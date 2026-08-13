@@ -1,0 +1,4 @@
+interface:
+  display_name: "SEO / GEO Audit"
+  short_description: "Audit technical SEO, GEO, schema, i18n, and CWV"
+  default_prompt: "Use $seo-audit to audit this site, rank the findings, and propose verified fixes."

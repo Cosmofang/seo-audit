@@ -1,270 +1,435 @@
 #!/usr/bin/env node
-// audit-seo.mjs — portable, zero-dependency on-disk SEO/quality auditor.
-//
-// Runs the reference site build-time "hard gate" checks against ANY built static
-// site (a directory of .html files + their local CSS/JS/images). Framework
-// agnostic: point it at Astro `dist/`, Next `out/`, Hugo `public/`, a Jekyll
-// `_site/`, or a plain folder of HTML.
-//
-//   node audit-seo.mjs [--dir dist] [--strict] [--max-page-kb 500]
-//                      [--max-img-kb 500] [--json]
-//
-// Severity model:
-//   ERROR — genuinely hurts ranking / breaks crawlers / fails Core Web Vitals.
-//           Exits 1 (CI gate).
-//   WARN  — best-practice miss; review. With --strict, warns become errors.
-//
-// No npm install. Pure Node >=18 (uses fs, path, no external HTML parser —
-// regex extraction is intentionally conservative and good enough for audit
-// signals; it does not execute or fully parse the DOM).
 
-import { readFileSync, statSync, readdirSync } from 'node:fs';
-import { join, extname, relative, resolve } from 'node:path';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 
-// ---- args -----------------------------------------------------------------
 const args = process.argv.slice(2);
-const opt = (name, def) => {
-  const i = args.indexOf(`--${name}`);
-  return i >= 0 && args[i + 1] && !args[i + 1].startsWith('--') ? args[i + 1] : def;
+const valueOf = (name, fallback) => {
+  const index = args.indexOf(`--${name}`);
+  return index >= 0 && args[index + 1] && !args[index + 1].startsWith('--')
+    ? args[index + 1]
+    : fallback;
 };
-const flag = (name) => args.includes(`--${name}`);
+const hasFlag = (name) => args.includes(`--${name}`);
+const valuesOf = (name) => args.flatMap((arg, index) => (
+  arg === `--${name}` && args[index + 1] && !args[index + 1].startsWith('--') ? [args[index + 1]] : []
+));
 
-const DIR = resolve(opt('dir', 'dist'));
-const STRICT = flag('strict');
-const JSON_OUT = flag('json');
-const MAX_PAGE = Number(opt('max-page-kb', '500')) * 1024;
-const MAX_IMG = Number(opt('max-img-kb', '500')) * 1024;
+if (hasFlag('help')) {
+  console.log(`usage: node scripts/audit-seo.mjs [options]
 
-const IMG_EXT = new Set(['.webp', '.avif', '.jpg', '.jpeg', '.png', '.gif', '.svg']);
-const SCRIPT_TYPE_ALLOW = new Set(['application/ld+json', 'application/json', 'importmap']);
-
-// ---- findings -------------------------------------------------------------
-const findings = []; // {file, sev:'error'|'warn', rule, msg}
-const add = (file, sev, rule, msg) => findings.push({ file, sev, rule, msg });
-
-// ---- fs walk --------------------------------------------------------------
-function* walk(dir) {
-  let entries;
-  try { entries = readdirSync(dir, { withFileTypes: true }); }
-  catch { return; }
-  for (const e of entries) {
-    const p = join(dir, e.name);
-    if (e.isDirectory()) yield* walk(p);
-    else yield p;
-  }
+options:
+  --dir <path>          build output directory (default: dist)
+  --origin <url>        expected canonical origin, e.g. https://www.example.com
+  --alternate-prefix p  repeatable output prefix whose canonical may point to a primary page
+  --strict              fail when warnings exist
+  --json                emit JSON
+  --max-page-kb <n>     HTML + local CSS/JS budget (default: 500)
+  --max-img-kb <n>      built image budget (default: 500)
+  --help                show this help`);
+  process.exit(0);
 }
 
-// ---- tiny HTML helpers (regex; conservative) ------------------------------
-const tagOpenRe = (tag) => new RegExp(`<${tag}\\b[^>]*>`, 'gi');
-const countTag = (html, tag) => (html.match(tagOpenRe(tag)) || []).length;
-const hasTag = (html, tag) => tagOpenRe(tag).test(html);
+const ROOT = resolve(valueOf('dir', 'dist'));
+const STRICT = hasFlag('strict');
+const JSON_OUT = hasFlag('json');
+const MAX_PAGE = Number(valueOf('max-page-kb', '500')) * 1024;
+const MAX_IMAGE = Number(valueOf('max-img-kb', '500')) * 1024;
+const ALTERNATE_PREFIXES = valuesOf('alternate-prefix').map((prefix) => (
+  prefix.replace(/^[/\\]+/, '').split('\\').join('/').replace(/\/+$/, '') + '/'
+));
+const IMAGE_EXTENSIONS = new Set(['.webp', '.avif', '.jpg', '.jpeg', '.png', '.gif', '.svg']);
+const ALLOWED_INLINE_SCRIPT_TYPES = new Set(['application/ld+json', 'application/json', 'importmap']);
 
-function attr(tagStr, name) {
-  const m = tagStr.match(new RegExp(`\\b${name}\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s>]+))`, 'i'));
-  if (!m) return null;
-  return m[2] ?? m[3] ?? m[4] ?? '';
-}
-const hasAttr = (tagStr, name) =>
-  new RegExp(`\\b${name}(\\s*=|[\\s>])`, 'i').test(tagStr);
-
-function allTags(html, tag) {
-  return html.match(tagOpenRe(tag)) || [];
-}
-
-// strip <head>..</head>? no — we scan whole doc; fine for these checks.
-
-// ---- per-page checks ------------------------------------------------------
-function auditHtml(file, html) {
-  const rel = relative(DIR, file);
-  // Error pages (404/50x) are intentionally noindex: they don't need a
-  // canonical, description, OG tags, or structured data. Skip those checks
-  // for them but still enforce h1/viewport/semantic/perf hygiene.
-  const isErrorPage = /(^|\/)(404|50\d)\.html$/i.test(rel);
-
-  // 1) exactly one <h1>
-  const h1 = countTag(html, 'h1');
-  if (h1 !== 1) add(rel, 'error', 'h1', `expected exactly 1 <h1>, got ${h1}`);
-
-  // 2) viewport meta
-  const metas = allTags(html, 'meta');
-  const vp = metas.find((m) => /name\s*=\s*["']?viewport/i.test(m));
-  if (!vp) add(rel, 'error', 'viewport', 'missing <meta name="viewport">');
-  else {
-    const c = attr(vp, 'content') || '';
-    if (!/width=device-width/i.test(c) || !/initial-scale=1/i.test(c))
-      add(rel, 'error', 'viewport', `viewport content invalid: "${c}"`);
-  }
-
-  // 3) semantic landmarks
-  for (const t of ['main', 'nav', 'footer'])
-    if (!hasTag(html, t)) add(rel, 'error', 'semantic', `missing <${t}>`);
-
-  // 4) <title>
-  const titleM = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  const title = titleM ? titleM[1].replace(/\s+/g, ' ').trim() : '';
-  if (!title) add(rel, 'error', 'title', 'missing or empty <title>');
-  else if (title.length < 10 || title.length > 60)
-    add(rel, 'warn', 'title', `title length ${title.length} (aim 10–60 chars)`);
-
-  // 5) meta description
-  const desc = metas.find((m) => /name\s*=\s*["']?description/i.test(m));
-  if (!desc) { if (!isErrorPage) add(rel, 'error', 'description', 'missing <meta name="description">'); }
-  else {
-    const c = (attr(desc, 'content') || '').trim();
-    if (c.length < 50 || c.length > 160)
-      add(rel, 'warn', 'description', `description length ${c.length} (aim 50–160 chars)`);
-  }
-
-  // 6) canonical
-  const links = allTags(html, 'link');
-  const canon = links.find((l) => /rel\s*=\s*["']?canonical/i.test(l));
-  if (!canon) { if (!isErrorPage) add(rel, 'error', 'canonical', 'missing <link rel="canonical">'); }
-  else {
-    const href = attr(canon, 'href') || '';
-    if (!/^https?:\/\//i.test(href))
-      add(rel, 'error', 'canonical', `canonical href must be absolute: "${href}"`);
-  }
-
-  // 7) Open Graph minimum
-  if (!isErrorPage) {
-    const ogTitle = metas.some((m) => /property\s*=\s*["']?og:title/i.test(m));
-    const ogImage = metas.some((m) => /property\s*=\s*["']?og:image/i.test(m));
-    if (!ogTitle) add(rel, 'warn', 'opengraph', 'missing og:title');
-    if (!ogImage) add(rel, 'warn', 'opengraph', 'missing og:image');
-  }
-
-  // 8) images: width/height/alt + loading strategy
-  for (const img of allTags(html, 'img')) {
-    const src = attr(img, 'src') || '(no src)';
-    if (!hasAttr(img, 'width') || !hasAttr(img, 'height'))
-      add(rel, 'error', 'img-dims', `<img> missing width/height — CLS risk (${src})`);
-    if (attr(img, 'alt') === null)
-      add(rel, 'error', 'img-alt', `<img> missing alt (${src})`);
-    const loading = (attr(img, 'loading') || '').toLowerCase();
-    const fetchpri = (attr(img, 'fetchpriority') || '').toLowerCase();
-    const isHero = loading === 'eager' || fetchpri === 'high';
-    if (isHero) {
-      if (fetchpri !== 'high')
-        add(rel, 'warn', 'img-hero', `hero/eager <img> should set fetchpriority="high" (${src})`);
-    } else if (loading !== 'lazy') {
-      add(rel, 'warn', 'img-lazy', `non-hero <img> should be loading="lazy" (${src})`);
+let expectedOrigin = null;
+const originArg = valueOf('origin', '');
+if (originArg) {
+  try {
+    const parsed = new URL(originArg);
+    if (!/^https?:$/.test(parsed.protocol) || parsed.pathname !== '/' || parsed.search || parsed.hash) {
+      throw new Error('origin must contain only scheme and host');
     }
+    expectedOrigin = parsed.origin;
+  } catch (error) {
+    emitFatal('invalid-origin', `invalid --origin "${originArg}": ${error.message}`);
   }
+}
+if (!Number.isFinite(MAX_PAGE) || MAX_PAGE <= 0 || !Number.isFinite(MAX_IMAGE) || MAX_IMAGE <= 0) {
+  emitFatal('invalid-budget', '--max-page-kb and --max-img-kb must be positive numbers');
+}
 
-  // 9) inline executable scripts + inline event handlers (CSP / perf)
-  const scriptRe = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
-  let sm;
-  while ((sm = scriptRe.exec(html))) {
-    const attrs = sm[1], body = sm[2];
-    if (hasAttr(attrs, 'src')) continue;        // external — ok
-    if (!body.trim()) continue;                  // empty — ok
-    const type = (attr(attrs, 'type') || '').toLowerCase();
-    if (SCRIPT_TYPE_ALLOW.has(type)) continue;   // data block (JSON-LD etc.) — ok
-    add(rel, 'warn', 'inline-script', `inline executable <script type="${type || '(default)'}"> (blocks strict CSP)`);
-  }
-  // inline on*= handlers
-  for (const m of html.matchAll(/<([a-zA-Z][\w-]*)\b([^>]*)>/g)) {
-    if (/\son[a-z]+\s*=/i.test(m[2]))
-      add(rel, 'warn', 'inline-handler', `<${m[1]}> has inline event handler (blocks strict CSP)`);
-  }
+const findings = [];
+const add = (file, severity, rule, message) => findings.push({ file, severity, rule, message });
+const pageRecords = [];
 
-  // 10) structured data presence
-  if (!isErrorPage && !/<script[^>]*type\s*=\s*["']application\/ld\+json/i.test(html))
-    add(rel, 'warn', 'jsonld', 'no JSON-LD structured data on page');
-
-  // 11) external resource references (informational for general SEO)
-  const extRefs = new Set();
-  const grab = (tag, a) => {
-    for (const t of allTags(html, tag)) {
-      const v = attr(t, a);
-      if (v && /^https?:\/\//i.test(v)) extRefs.add(v.split('?')[0]);
-    }
+function emitFatal(rule, message) {
+  const payload = {
+    dir: ROOT,
+    origin: expectedOrigin,
+    scanned: { html: 0, css: 0, img: 0 },
+    errors: [{ file: '.', severity: 'error', rule, message }],
+    warnings: [],
   };
-  grab('script', 'src'); grab('img', 'src'); grab('source', 'src');
-  for (const l of links) {
-    const r = (attr(l, 'rel') || '').toLowerCase();
-    if (/(stylesheet|preload|prefetch)/.test(r)) {
-      const v = attr(l, 'href');
-      if (v && /^https?:\/\//i.test(v)) extRefs.add(v.split('?')[0]);
-    }
-  }
-  if (extRefs.size)
-    add(rel, 'warn', 'external-res', `${extRefs.size} external resource ref(s) (self-host for CSP + speed): ${[...extRefs].slice(0, 3).join(', ')}${extRefs.size > 3 ? ' …' : ''}`);
-
-  // 12) page weight: HTML + local CSS + local JS
-  let total = Buffer.byteLength(html, 'utf8');
-  const addLocal = (url) => {
-    if (!url || !url.startsWith('/')) return;
-    try { total += statSync(join(DIR, url.split('?')[0])).size; } catch {}
-  };
-  for (const l of links)
-    if (/rel\s*=\s*["']?stylesheet/i.test(l)) addLocal(attr(l, 'href'));
-  for (const s of allTags(html, 'script')) addLocal(attr(s, 'src'));
-  if (total > MAX_PAGE)
-    add(rel, 'error', 'page-weight', `HTML+CSS+JS = ${(total / 1024).toFixed(0)} KB > ${(MAX_PAGE / 1024).toFixed(0)} KB budget`);
-}
-
-// ---- standalone CSS baseline (font-size floor) ----------------------------
-function auditCss(file, css) {
-  const rel = relative(DIR, file);
-  for (const m of css.matchAll(/font-size\s*:\s*([^;}]+)/gi)) {
-    const raw = m[1].replace(/!important/i, '').trim();
-    if (/^(var\(|calc\(|inherit|initial|unset|0\b)/.test(raw)) continue;
-    const um = raw.match(/^([\d.]+)(px|pt|rem|em)?$/);
-    if (!um) continue;
-    const n = parseFloat(um[1]); const unit = um[2] || 'px';
-    const px = unit === 'px' ? n : unit === 'pt' ? n * 1.3333 : n * 16; // rem/em ≈16px base
-    if (px < 10) add(rel, 'warn', 'baseline-font', `font-size ${raw} (≈${px.toFixed(0)}px) < 10px floor`);
-  }
-}
-
-// ---- image file sizes -----------------------------------------------------
-function auditImageFile(file) {
-  const rel = relative(DIR, file);
-  const bytes = statSync(file).size;
-  if (bytes > MAX_IMG)
-    add(rel, 'warn', 'img-size', `${(bytes / 1024).toFixed(0)} KB > ${(MAX_IMG / 1024).toFixed(0)} KB — recompress / use WebP/AVIF`);
-}
-
-// ---- run ------------------------------------------------------------------
-let nHtml = 0, nCss = 0, nImg = 0;
-let dirOk = true;
-try { statSync(DIR); } catch { dirOk = false; }
-if (!dirOk) {
-  console.error(`✗ directory not found: ${DIR}\n  pass --dir <build output> (e.g. dist, out, public, _site)`);
+  if (JSON_OUT) console.log(JSON.stringify(payload, null, 2));
+  else console.error(`x [${rule}] ${message}`);
   process.exit(2);
 }
 
-for (const file of walk(DIR)) {
-  const ext = extname(file).toLowerCase();
-  if (ext === '.html') { nHtml++; auditHtml(file, readFileSync(file, 'utf8')); }
-  else if (ext === '.css') { nCss++; auditCss(file, readFileSync(file, 'utf8')); }
-  else if (IMG_EXT.has(ext)) { nImg++; auditImageFile(file); }
+function* walk(directory) {
+  let entries;
+  try {
+    entries = readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    add(relative(ROOT, directory) || '.', 'error', 'read-directory', error.message);
+    return;
+  }
+  for (const entry of entries) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) yield* walk(path);
+    else if (entry.isFile()) yield path;
+  }
 }
 
-// ---- report ---------------------------------------------------------------
-const errors = findings.filter((f) => f.sev === 'error');
-const warns = findings.filter((f) => f.sev === 'warn');
+function tags(html, name) {
+  return html.match(new RegExp(`<${name}\\b[^>]*>`, 'gi')) || [];
+}
+
+function attributes(tag) {
+  const out = new Map();
+  const body = tag.replace(/^<[^\s>]+\s*/i, '').replace(/\/?>$/, '');
+  const expression = /([^\s=/>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  let match;
+  while ((match = expression.exec(body))) {
+    out.set(match[1].toLowerCase(), match[2] ?? match[3] ?? match[4] ?? '');
+  }
+  return out;
+}
+
+function findMeta(metas, key, value) {
+  const expected = value.toLowerCase();
+  return metas.find((tag) => (attributes(tag).get(key) || '').toLowerCase() === expected);
+}
+
+function relTokens(tag) {
+  return new Set((attributes(tag).get('rel') || '').toLowerCase().split(/\s+/).filter(Boolean));
+}
+
+function decodeText(value) {
+  return value
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function expectedPath(file) {
+  const rel = relative(ROOT, file).split(sep).join('/');
+  if (rel === 'index.html') return '/';
+  if (rel.endsWith('/index.html')) return `/${rel.slice(0, -'index.html'.length)}`;
+  return `/${rel}`;
+}
+
+function isAlternateOutput(file) {
+  const rel = relative(ROOT, file).split(sep).join('/');
+  return ALTERNATE_PREFIXES.some((prefix) => rel.startsWith(prefix));
+}
+
+function isErrorPage(file) {
+  const rel = relative(ROOT, file).split(sep).join('/');
+  return /(^|\/)(404|50\d)(?:\/index)?\.html$/i.test(rel);
+}
+
+function localAsset(file, reference) {
+  if (!reference || /^(?:data:|blob:|mailto:|tel:|#)/i.test(reference)) return null;
+  let normalizedReference = reference;
+  if (/^https?:\/\//i.test(reference) || reference.startsWith('//')) {
+    let absolute;
+    try {
+      absolute = new URL(reference, expectedOrigin || 'https://audit.invalid');
+    } catch {
+      return null;
+    }
+    if (!expectedOrigin || absolute.origin !== expectedOrigin) return null;
+    normalizedReference = `${absolute.pathname}${absolute.search}${absolute.hash}`;
+  }
+  const withoutFragment = normalizedReference.split('#')[0];
+  const withoutQuery = withoutFragment.split('?')[0];
+  let pathname;
+  try {
+    pathname = decodeURIComponent(withoutQuery);
+  } catch {
+    return null;
+  }
+  const target = normalizedReference.startsWith('/')
+    ? resolve(ROOT, `.${pathname}`)
+    : resolve(dirname(file), pathname);
+  const rootPrefix = ROOT.endsWith(sep) ? ROOT : `${ROOT}${sep}`;
+  if (target !== ROOT && !target.startsWith(rootPrefix)) return null;
+  return existsSync(target) && statSync(target).isFile() ? target : null;
+}
+
+function isExternalResource(reference) {
+  if (!reference || /^(?:data:|blob:|#)/i.test(reference)) return false;
+  if (!/^https?:\/\//i.test(reference)) return false;
+  if (!expectedOrigin) return true;
+  try {
+    return new URL(reference).origin !== expectedOrigin;
+  } catch {
+    return true;
+  }
+}
+
+function srcsetUrls(value) {
+  return value.split(',').map((part) => part.trim().split(/\s+/)[0]).filter(Boolean);
+}
+
+function structuredTypes(node) {
+  if (Array.isArray(node)) return node.flatMap(structuredTypes);
+  if (!node || typeof node !== 'object') return [];
+  const own = Array.isArray(node['@type']) ? node['@type'] : node['@type'] ? [node['@type']] : [];
+  const graph = node['@graph'] ? structuredTypes(node['@graph']) : [];
+  return [...own, ...graph];
+}
+
+function scanCss(file, css, label) {
+  for (const match of css.matchAll(/(?:url\(\s*['"]?([^'")]+)|@import\s+(?:url\()?\s*['"]([^'"]+))/gi)) {
+    const url = (match[1] || match[2] || '').trim();
+    if (isExternalResource(url)) add(label, 'warn', 'external-resource', `external CSS resource: ${url}`);
+  }
+  for (const match of css.matchAll(/font-size\s*:\s*([^;}]+)/gi)) {
+    const raw = match[1].replace(/!important/i, '').trim();
+    if (/^(?:var\(|calc\(|clamp\(|inherit|initial|unset|0\b)/i.test(raw)) continue;
+    const unit = raw.match(/^([\d.]+)(px|pt|rem|em)?$/i);
+    if (!unit) continue;
+    const number = Number(unit[1]);
+    const px = !unit[2] || unit[2].toLowerCase() === 'px'
+      ? number
+      : unit[2].toLowerCase() === 'pt' ? number * 1.3333 : number * 16;
+    if (px < 10) add(label, 'warn', 'font-size', `font-size ${raw} is below the 10px project floor`);
+  }
+}
+
+function auditHtml(file, html) {
+  const label = relative(ROOT, file).split(sep).join('/');
+  const errorPage = isErrorPage(file);
+  const alternateOutput = isAlternateOutput(file);
+  const metas = tags(html, 'meta');
+  const links = tags(html, 'link');
+  const images = tags(html, 'img');
+
+  const h1Count = tags(html, 'h1').length;
+  if (h1Count !== 1) add(label, 'error', 'h1', `expected exactly one <h1>, found ${h1Count}`);
+
+  const viewport = findMeta(metas, 'name', 'viewport');
+  if (!viewport) add(label, 'error', 'viewport', 'missing <meta name="viewport">');
+  else {
+    const content = attributes(viewport).get('content') || '';
+    if (!/width\s*=\s*device-width/i.test(content) || !/initial-scale\s*=\s*1(?:\.0)?(?:\D|$)/i.test(content)) {
+      add(label, 'error', 'viewport', `invalid viewport content: "${content}"`);
+    }
+  }
+
+  for (const landmark of ['main', 'nav', 'footer']) {
+    if (tags(html, landmark).length === 0) add(label, 'error', 'semantic', `missing <${landmark}>`);
+  }
+
+  const titleMatch = html.match(/<title\b[^>]*>([\s\S]*?)<\/title>/i);
+  const title = titleMatch ? decodeText(titleMatch[1]) : '';
+  if (!title) add(label, 'error', 'title', 'missing or empty <title>');
+  else if ([...title].length < 10 || [...title].length > 70) {
+    add(label, 'warn', 'title-length', `title length ${[...title].length}; review SERP fit and intent`);
+  }
+
+  const descriptionTag = findMeta(metas, 'name', 'description');
+  const description = descriptionTag ? (attributes(descriptionTag).get('content') || '').trim() : '';
+  if (!errorPage && !description) add(label, 'error', 'description', 'missing or empty meta description');
+  else if (description && ([...description].length < 50 || [...description].length > 180)) {
+    add(label, 'warn', 'description-length', `description length ${[...description].length}; review snippet fit`);
+  }
+
+  const robots = (attributes(findMeta(metas, 'name', 'robots') || '').get('content') || '').toLowerCase();
+  const noindex = /\bnoindex\b/.test(robots);
+
+  const canonicals = links.filter((link) => relTokens(link).has('canonical'));
+  let canonical = '';
+  if (!errorPage && canonicals.length !== 1) {
+    add(label, 'error', 'canonical-count', `expected exactly one canonical, found ${canonicals.length}`);
+  }
+  if (canonicals.length) {
+    canonical = attributes(canonicals[0]).get('href') || '';
+    try {
+      const parsed = new URL(canonical);
+      if (!/^https?:$/.test(parsed.protocol)) throw new Error('canonical must use HTTP(S)');
+      if (expectedOrigin && parsed.origin !== expectedOrigin) {
+        add(label, 'error', 'canonical-origin', `canonical origin ${parsed.origin} does not match ${expectedOrigin}`);
+      }
+      const expected = expectedPath(file);
+      if (!errorPage && !alternateOutput && parsed.pathname !== expected) {
+        add(label, 'error', 'canonical-path', `canonical path ${parsed.pathname} does not match built route ${expected}`);
+      }
+      if (parsed.hash) add(label, 'error', 'canonical-fragment', 'canonical must not contain a fragment');
+    } catch (error) {
+      add(label, 'error', 'canonical-url', `canonical is not a valid absolute URL: "${canonical}" (${error.message})`);
+    }
+  }
+
+  if (!errorPage && !alternateOutput) {
+    for (const property of ['og:title', 'og:image']) {
+      const meta = findMeta(metas, 'property', property);
+      if (!meta || !(attributes(meta).get('content') || '').trim()) {
+        add(label, 'warn', 'open-graph', `missing or empty ${property}`);
+      }
+    }
+  }
+
+  for (const image of images) {
+    const attrs = attributes(image);
+    const src = attrs.get('src') || '(missing src)';
+    if (!attrs.has('width') || !attrs.has('height')) add(label, 'error', 'image-dimensions', `<img src="${src}"> missing width/height`);
+    if (!attrs.has('alt')) add(label, 'error', 'image-alt', `<img src="${src}"> missing alt`);
+    const highPriority = (attrs.get('fetchpriority') || '').toLowerCase() === 'high';
+    const eager = (attrs.get('loading') || '').toLowerCase() === 'eager';
+    if (eager && !highPriority) add(label, 'warn', 'image-priority', `eager image should be reviewed for fetchpriority="high": ${src}`);
+    if (!eager && !highPriority && (attrs.get('loading') || '').toLowerCase() !== 'lazy') {
+      add(label, 'warn', 'image-loading', `non-priority image is not loading="lazy": ${src}`);
+    }
+  }
+
+  const scriptExpression = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  const schemaTypes = [];
+  let scriptMatch;
+  while ((scriptMatch = scriptExpression.exec(html))) {
+    const attrs = attributes(`<script ${scriptMatch[1]}>`);
+    const body = scriptMatch[2].trim();
+    const type = (attrs.get('type') || '').toLowerCase();
+    if (type === 'application/ld+json' && body) {
+      try {
+        schemaTypes.push(...structuredTypes(JSON.parse(body)));
+      } catch (error) {
+        add(label, 'error', 'jsonld-parse', `invalid JSON-LD: ${error.message}`);
+      }
+    }
+    if (!attrs.has('src') && body && !ALLOWED_INLINE_SCRIPT_TYPES.has(type)) {
+      add(label, 'warn', 'inline-script', `inline executable script type="${type || '(default)'}" blocks a strict CSP`);
+    }
+  }
+  if (!errorPage && schemaTypes.length === 0) add(label, 'warn', 'jsonld-missing', 'no parseable JSON-LD found');
+  if (expectedPath(file) === '/' && !errorPage) {
+    for (const type of ['Organization', 'WebSite']) {
+      if (!schemaTypes.includes(type)) add(label, 'warn', 'jsonld-site', `homepage JSON-LD missing ${type}`);
+    }
+  }
+
+  for (const match of html.matchAll(/<([a-z][\w-]*)\b([^>]*)>/gi)) {
+    if (/\son[a-z]+\s*=/i.test(match[2])) add(label, 'warn', 'inline-handler', `<${match[1]}> has an inline event handler`);
+  }
+
+  const resourceChecks = [
+    ...tags(html, 'script').map((tag) => [tag, 'src']),
+    ...tags(html, 'img').flatMap((tag) => [[tag, 'src'], [tag, 'srcset']]),
+    ...tags(html, 'source').flatMap((tag) => [[tag, 'src'], [tag, 'srcset']]),
+    ...tags(html, 'video').map((tag) => [tag, 'poster']),
+    ...links.filter((tag) => [...relTokens(tag)].some((token) => ['stylesheet', 'preload', 'prefetch', 'modulepreload'].includes(token))).map((tag) => [tag, 'href']),
+  ];
+  for (const [tag, attrName] of resourceChecks) {
+    const value = attributes(tag).get(attrName);
+    if (!value) continue;
+    const urls = attrName === 'srcset' ? srcsetUrls(value) : [value];
+    for (const url of urls) {
+      if (isExternalResource(url)) add(label, 'warn', 'external-resource', `external ${attrName} resource: ${url}`);
+    }
+  }
+  for (const style of html.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi)) scanCss(file, style[1], label);
+  for (const style of html.matchAll(/\sstyle\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)) scanCss(file, style[1] || style[2] || '', label);
+
+  let pageBytes = Buffer.byteLength(html, 'utf8');
+  const seenAssets = new Set();
+  const budgetRefs = [
+    ...links.filter((tag) => relTokens(tag).has('stylesheet')).map((tag) => attributes(tag).get('href')),
+    ...tags(html, 'script').map((tag) => attributes(tag).get('src')),
+  ];
+  for (const reference of budgetRefs) {
+    const asset = localAsset(file, reference);
+    if (asset && !seenAssets.has(asset)) {
+      seenAssets.add(asset);
+      pageBytes += statSync(asset).size;
+    }
+  }
+  if (pageBytes > MAX_PAGE) {
+    add(label, 'error', 'page-weight', `HTML+local CSS/JS ${(pageBytes / 1024).toFixed(1)} KB exceeds ${(MAX_PAGE / 1024).toFixed(0)} KB`);
+  }
+
+  pageRecords.push({ file: label, errorPage, alternateOutput, noindex, title, description, canonical });
+}
+
+if (!existsSync(ROOT) || !statSync(ROOT).isDirectory()) emitFatal('directory', `build directory not found: ${ROOT}`);
+
+let htmlCount = 0;
+let cssCount = 0;
+let imageCount = 0;
+for (const file of walk(ROOT)) {
+  const extension = extname(file).toLowerCase();
+  if (extension === '.html') {
+    htmlCount += 1;
+    auditHtml(file, readFileSync(file, 'utf8'));
+  } else if (extension === '.css') {
+    cssCount += 1;
+    scanCss(file, readFileSync(file, 'utf8'), relative(ROOT, file).split(sep).join('/'));
+  } else if (IMAGE_EXTENSIONS.has(extension)) {
+    imageCount += 1;
+    const bytes = statSync(file).size;
+    if (bytes > MAX_IMAGE) {
+      add(relative(ROOT, file).split(sep).join('/'), 'warn', 'image-size', `${(bytes / 1024).toFixed(1)} KB exceeds ${(MAX_IMAGE / 1024).toFixed(0)} KB`);
+    }
+  }
+}
+
+if (htmlCount === 0) add('.', 'error', 'no-html', 'zero HTML files found; --dir is not a usable build output');
+
+for (const [field, severity] of [['title', 'warn'], ['description', 'warn'], ['canonical', 'error']]) {
+  const grouped = new Map();
+  for (const page of pageRecords) {
+    if (page.errorPage || page.alternateOutput || page.noindex || !page[field]) continue;
+    const key = page[field];
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(page.file);
+  }
+  for (const [value, files] of grouped) {
+    if (files.length > 1) add(files.join(', '), severity, `duplicate-${field}`, `${files.length} indexable pages share ${field}: "${value}"`);
+  }
+}
+
+const errors = findings.filter((item) => item.severity === 'error');
+const warnings = findings.filter((item) => item.severity === 'warn');
+const report = {
+  dir: ROOT,
+  origin: expectedOrigin,
+  alternatePrefixes: ALTERNATE_PREFIXES,
+  scanned: { html: htmlCount, css: cssCount, img: imageCount },
+  errors,
+  warnings,
+};
 
 if (JSON_OUT) {
-  console.log(JSON.stringify({ dir: DIR, scanned: { html: nHtml, css: nCss, img: nImg }, errors, warns }, null, 2));
+  console.log(JSON.stringify(report, null, 2));
 } else {
-  const byFile = {};
-  for (const f of findings) (byFile[f.file] ||= []).push(f);
-  const icon = (s) => (s === 'error' ? '✗' : '⚠');
-  for (const [file, fs] of Object.entries(byFile)) {
-    console.log(`\n${file}`);
-    for (const f of fs.sort((a, b) => (a.sev === b.sev ? 0 : a.sev === 'error' ? -1 : 1)))
-      console.log(`  ${icon(f.sev)} [${f.rule}] ${f.msg}`);
+  const byFile = new Map();
+  for (const finding of findings) {
+    if (!byFile.has(finding.file)) byFile.set(finding.file, []);
+    byFile.get(finding.file).push(finding);
   }
-  // Rough heuristic score: errors dominate; warns nudge. Repeated soft
-  // advisories (e.g. long titles across many pages) shouldn't crater it.
-  const score = Math.max(0, Math.round(100 - errors.length * 8 - warns.length * 0.5));
-  console.log(`\n${'─'.repeat(56)}`);
-  console.log(`scanned: ${nHtml} html · ${nCss} css · ${nImg} images`);
-  console.log(`errors: ${errors.length}   warnings: ${warns.length}   heuristic score: ${score}/100`);
-  if (nHtml === 0) console.log('note: 0 HTML files found — is --dir pointing at the build output?');
+  for (const [file, items] of byFile) {
+    console.log(`\n${file}`);
+    for (const item of items.sort((a, b) => a.severity.localeCompare(b.severity))) {
+      console.log(`  ${item.severity === 'error' ? 'x' : '!'} [${item.rule}] ${item.message}`);
+    }
+  }
+  console.log(`\nscanned: ${htmlCount} html | ${cssCount} css | ${imageCount} images`);
+  console.log(`errors: ${errors.length} | warnings: ${warnings.length}`);
 }
 
-const failed = errors.length > 0 || (STRICT && warns.length > 0);
-process.exit(failed ? 1 : 0);
+process.exit(errors.length > 0 || (STRICT && warnings.length > 0) ? 1 : 0);
